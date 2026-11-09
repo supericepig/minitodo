@@ -18,16 +18,19 @@
 #include <ShlObj.h>
 #include <dwmapi.h>
 #include <winhttp.h>
+#include <imm.h>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
 #include <cwchar>
+#include <cstdio>
 #include <cstdarg>
+#include <functional>
 
 // ---------------- 常量 ----------------
 #define APP_NAME     L"MiniTodo"
-#define APP_VER      L"1.8.0"    // 每次功能修改后递增 (功能+0.1 / 修复+0.0.1)
+#define APP_VER      L"2.0.8"    // 每次功能修改后递增 (功能+0.1 / 修复+0.0.1)
 #define WM_APP_TRAY  (WM_APP + 1)   // 托盘回调
 #define WM_APP_DLG   (WM_APP + 2)   // 对话框结果 (lParam = new DlgResult)
 
@@ -40,8 +43,9 @@ static int SC(int v) { return (int)(v * g_s + 0.5); }   // 像素值按 DPI 缩�
 static void RecalcLayout();   // 前置声明: 定义在 MainProc 之后 (依赖 MkFont)
 static void CheckDisplayFit(HWND h);   // 前置声明: DPI 自检 (定义在 MainProc 之后)
 static void FitWindowToScreen(HWND h);   // 前置声明: DPI 校正 + 窗口完整包含于屏幕工作区 (定义在 MainProc 之后)
-static UINT GetWindowDpi(HWND h);   // 前置声明: 取窗口所在屏幕 DPI (定义在 MainProc 之后)
+static UINT GetWindowDpi(HWND h);   // 前置声明: 取窗口当前生效的 DPI (定义在 MainProc 之后)
 static UINT GetMonitorDpi(HWND h);   // 前置声明: 取窗口所在屏幕的真实 DPI (定义在 MainProc 之后)
+static UINT GetMonitorDpiOf(HMONITOR mon);   // 前置声明: 取指定屏幕的真实 DPI (定义在 MainProc 之后)
 static void RebuildRows();           // 前置声明: 重建显示行 (定义在主窗口绘制区)
 static void UpdateTrayTip();         // 前置声明: 更新托盘提示 (定义在托盘区)
 
@@ -63,7 +67,7 @@ static int EDGE     = 6;              // 窗口边缘拖拽热区
 // 顶栏按钮 ID
 enum { B_ADD = 1, B_TAB0, B_TAB1, B_PIN, B_OPM, B_OPTXT, B_OPP, B_CLOSE, B_SET, B_BG };
 // 对话框模式
-enum { DLG_ADDTASK = 1, DLG_EDITTASK, DLG_SUBTASK, DLG_SETTINGS, DLG_DAVREST, DLG_COLORPOP, DLG_BKDIFF };
+enum { DLG_ADDTASK = 1, DLG_EDITTASK, DLG_SUBTASK, DLG_SETTINGS, DLG_DAVREST, DLG_COLORPOP, DLG_BKDIFF, DLG_CONFIRM };
 // 对话框内部控件 ID
 enum { IDC_E1 = 200, IDC_E2, IDC_E3, IDC_LIST, IDC_ADDSUB, IDC_EDITSUB, IDC_DELSUB, IDC_CHKAUTO, IDC_HK, IDC_AUTO, IDC_FOLDER, IDC_KEEP, IDC_REST, IDC_DELB, IDC_BKMODE0, IDC_BKMODE1, IDC_BKMODE2, IDC_HOURS, IDC_SYNC };
 #define BGCOUNT 9
@@ -213,6 +217,19 @@ static std::wstring Trim(const std::wstring& s) {
     if (a == std::wstring::npos) return L"";
     size_t b = s.find_last_not_of(L" \t\r\n");
     return s.substr(a, b - a + 1);
+}
+// 多行编辑框输入的任务文本压成单行: 换行/回车/Tab → 空格并合并连续空白 (列表行内不显示硬换行)
+static std::wstring OneLine(const std::wstring& s) {
+    std::wstring o;
+    o.reserve(s.size());
+    bool sp = false;
+    for (wchar_t c : s) {
+        if (c == L'\r' || c == L'\n' || c == L'\t' || c == L' ') { sp = true; continue; }
+        if (sp && !o.empty()) o += L' ';
+        sp = false;
+        o += c;
+    }
+    return o;
 }
 // 编译日期时间 (取自编译器宏, 每次编译自动更新)
 static std::wstring BuildStamp() {
@@ -441,13 +458,29 @@ static std::string SerializeApp() {
         o += "]}";
     }
     RECT rc = { 80, 60, 500, 620 };
-    if (g_hwnd) GetWindowRect(g_hwnd, &rc);
-    char ui[384];
+    long long lw = g_logW, lh = g_logH, sdpi = g_dpiNow;   // 逻辑尺寸 (96dpi 基准) 与保存时屏幕 DPI
+    long long wax = 0, way = 0, waw = 0, wah = 0;          // 保存时所在屏幕的工作区 (用于按相对位置跨屏还原)
+    if (g_hwnd) {
+        GetWindowRect(g_hwnd, &rc);
+        UINT mdpi = GetMonitorDpi(g_hwnd);
+        if (mdpi) sdpi = mdpi;
+        HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) };
+        if (mon && GetMonitorInfoW(mon, &mi)) {
+            wax = mi.rcWork.left; way = mi.rcWork.top;
+            waw = mi.rcWork.right - mi.rcWork.left;
+            wah = mi.rcWork.bottom - mi.rcWork.top;
+        }
+    }
+    char ui[512];
     sprintf(ui, "],\"ui\":{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"alpha\":%d,\"topmost\":%s,\"hotkey\":",
         rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, (int)g_alpha, g_topmost ? "true" : "false");
     o += ui;
     JsonEsc(g_hkStr, o);
-    char bg[64];
+    char extra[192], bg[64];
+    sprintf(extra, ",\"lw\":%lld,\"lh\":%lld,\"dpi\":%lld,\"wax\":%lld,\"way\":%lld,\"waw\":%lld,\"wah\":%lld",
+            lw, lh, sdpi, wax, way, waw, wah);   // 跨屏/跨 DPI 还原用 (v1.9+)
+    o += extra;
     sprintf(bg, ",\"bg\":\"%02X%02X%02X\",\"showstart\":%s}",
             GetRValue(g_bg), GetGValue(g_bg), GetBValue(g_bg), g_showStart ? "true" : "false");
     o += bg;
@@ -540,12 +573,43 @@ static void LoadAppData() {
         g_showStart = ui->boolOf(L"showstart", true);
         long long x = ui->intOf(L"x", 80), y = ui->intOf(L"y", 60);
         long long w = ui->intOf(L"w", SC(420)), h = ui->intOf(L"h", SC(560));
-        if (w < SC(360)) w = SC(360); if (h < SC(240)) h = SC(240);
-        RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-        if (x < wa.left - SC(40) || x > wa.right - SC(80))  x = wa.left + SC(60);
-        if (y < wa.top - SC(40)  || y > wa.bottom - SC(80)) y = wa.top + SC(60);
-        if (g_hwnd)
-            SetWindowPos(g_hwnd, nullptr, (int)x, (int)y, (int)w, (int)h, SWP_NOZORDER | SWP_NOACTIVATE);
+        long long lw = ui->intOf(L"lw", -1), lh = ui->intOf(L"lh", -1);   // 逻辑尺寸 (96dpi 基准, v1.9+)
+        long long wax = ui->intOf(L"wax", 0), way = ui->intOf(L"way", 0);
+        long long waw = ui->intOf(L"waw", 0), wah = ui->intOf(L"wah", 0);
+        if (g_hwnd) {
+            // 目标屏: 保存坐标点最近的那块屏 (外接屏被拔掉后自动落到剩余屏)
+            POINT spt = { (LONG)x, (LONG)y };
+            HMONITOR mon = MonitorFromPoint(spt, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi = { sizeof(mi) };
+            RECT wa;
+            if (mon && GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
+            else SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+            // 布局/字体先按目标屏 DPI 重算; 尺寸按"逻辑尺寸 × 目标屏缩放"还原,
+            // 笔记本高分屏/外接 FHD 屏等不同缩放率之间物理大小基本一致, 启动后也无需二次跳变
+            UINT mdpi = mon ? GetMonitorDpiOf(mon) : 0;
+            if (mdpi && mdpi != g_dpiNow) { g_dpiNow = mdpi; g_s = mdpi / 96.0; RecalcLayout(); }
+            LONG nw, nh;
+            if (lw > 0 && lh > 0) { nw = SC((int)lw); nh = SC((int)lh); }
+            else { nw = (LONG)w; nh = (LONG)h; }   // 旧版配置: 沿用像素值
+            if (nw < SC(360)) nw = SC(360);
+            if (nh < SC(240)) nh = SC(240);
+            // 屏幕环境变化 (换屏/改缩放率/拔掉外接屏): 按保存时工作区的相对比例还原位置
+            bool sameWa = waw > 0 && wah > 0 && wax == wa.left && way == wa.top
+                          && waw == wa.right - wa.left && wah == wa.bottom - wa.top;
+            if (!sameWa && waw > 0 && wah > 0) {
+                double fx = (x - wax) / (double)waw;
+                double fy = (y - way) / (double)wah;
+                x = wa.left + (LONG)(fx * (wa.right - wa.left) + 0.5);
+                y = wa.top  + (LONG)(fy * (wa.bottom - wa.top) + 0.5);
+            }
+            // 完整夹入目标屏工作区
+            if (x > wa.right - nw)  x = wa.right - nw;
+            if (x < wa.left)        x = wa.left;
+            if (y > wa.bottom - nh) y = wa.bottom - nh;
+            if (y < wa.top)         y = wa.top;
+            SetWindowPos(g_hwnd, nullptr, (int)x, (int)y, (int)nw, (int)nh, SWP_NOZORDER | SWP_NOACTIVATE);
+            FitWindowToScreen(g_hwnd);   // 兜底: DPI 一致性与包含性自检
+        }
     }
     if (const JVal* wd = root.get(L"webdav")) {
         g_webdavUrl = wd->strOf(L"url");
@@ -1069,8 +1133,10 @@ static void UpdateTrayTip() {
 }
 
 // ---------------- 视图 ----------------
+static void InvalidateRowHeights();   // 前置声明: 使行高缓存失效 (定义在下方行高区)
 static void RebuildRows() {
     g_rows.clear();
+    InvalidateRowHeights();   // 任务内容可能已变化, 行高缓存需重算
     for (int i = 0; i < (int)g_tasks.size(); ++i) {
         const Task& t = g_tasks[i];
         if (t.done == (g_view == 1)) {
@@ -1087,7 +1153,85 @@ static void RebuildRows() {
         SendMessageW(g_hwnd, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
     }
 }
-static int RowHeight(int idx) { return g_rows[idx].s < 0 ? ROW_H : SUBROW_H; }
+// 行高缓存: 文本超宽时自动换行, 行高按内容动态计算 (键: 行数/客户区宽度/DPI)
+static std::vector<int> g_rowHc;
+static int g_rowHcW = -1, g_rowHcDpi = 0;
+// 手动按可用宽度断行: DrawText 的 DT_WORDBREAK 只在空白处断行, 中文连续文本不会折行,
+// 故按字符宽度自行断行 —— 中文逐字断, 英文尽量按单词断; out 非空时输出断点插入 \n 的文本
+static bool WsChar(wchar_t c) { return c == L' ' || c == L'\t'; }
+static int WrapText(HDC dc, const std::wstring& text, int availW, std::wstring* out) {
+    int n = (int)text.size();
+    int lines = 0, start = 0;
+    if (out) out->clear();
+    while (start < n) {
+        // 二分求当前行能容纳的字符数
+        int fit = 0, lo = 1, hi = n - start;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            SIZE sz; GetTextExtentPoint32W(dc, text.c_str() + start, mid, &sz);
+            if (sz.cx <= availW) { fit = mid; lo = mid + 1; } else hi = mid - 1;
+        }
+        if (fit == 0) fit = 1;   // 单字超宽也至少放一个
+        int next = start + fit;
+        if (next < n && !WsChar(text[next])) {
+            // 断点落在单词中间: 尝试回退到最近的空白处按词断行 (英文);
+            // 找不到空白 (中文连续文本) 则保持逐字断行
+            int sp = next;
+            while (sp > start && !WsChar(text[sp - 1])) --sp;
+            if (sp > start) next = sp;
+        }
+        // 断点后的空白留在行尾, 下一行从非空白开始
+        while (next < n && WsChar(text[next])) ++next;
+        if (next <= start) next = start + 1;
+        if (out) { if (lines) *out += L'\n'; *out += text.substr(start, next - start); }
+        start = next;
+        ++lines;
+        if (lines > 100) break;   // 防御上限
+    }
+    return lines > 0 ? lines : 1;
+}
+// 计算某行显示所需高度: 文本按可用宽度折行测量, 不足基础行高则取基础行高
+static int CalcRowHeight(int idx, int w) {
+    const RowRef& rr = g_rows[idx];
+    const Task& t = g_tasks[rr.t];
+    bool isSub = rr.s >= 0;
+    const std::wstring& text = isSub ? t.subs[rr.s].text : t.text;
+    const std::wstring& due = isSub ? t.subs[rr.s].due : t.due;
+    bool done = isSub ? t.subs[rr.s].done : t.done;
+    int baseH = isSub ? SUBROW_H : ROW_H;
+    bool showDue = !due.empty() && !done && DateState(due) != -2;
+    int tx = isSub ? SC(46) : SC(40);
+    int textRight = showDue ? w - SC(96) : w - SC(8);
+    int availW = textRight - tx;
+    if (text.empty() || availW <= 0) return baseH;
+    HDC dc = GetDC(g_hwnd);
+    if (!dc) return baseH;
+    HFONT f = done ? (isSub ? fStrikeSub : fStrike) : (isSub ? fSub : fRow);
+    HFONT of = (HFONT)SelectObject(dc, f);
+    RECT r1 = { 0, 0, 0, 0 };
+    DrawTextW(dc, L"Mg", -1, &r1, DT_SINGLELINE | DT_CALCRECT);   // 单行文字高 (算留白用)
+    std::wstring wrapped;
+    WrapText(dc, text, availW, &wrapped);
+    RECT r2 = { 0, 0, availW, 0 };
+    DrawTextW(dc, wrapped.c_str(), -1, &r2, DT_WORDBREAK | DT_CALCRECT);   // 折行后总高
+    SelectObject(dc, of);
+    ReleaseDC(g_hwnd, dc);
+    int need = r2.bottom + (baseH - r1.bottom);   // 文本高 + 与基础行高相同的上下留白
+    return need > baseH ? need : baseH;
+}
+static void InvalidateRowHeights() { g_rowHcW = -1; }
+static int RowHeight(int idx) {
+    if (g_hwnd) {
+        RECT rc; GetClientRect(g_hwnd, &rc);
+        if ((int)g_rowHc.size() != (int)g_rows.size() || g_rowHcW != rc.right || g_rowHcDpi != g_dpiNow) {
+            g_rowHc.resize(g_rows.size());
+            for (int i = 0; i < (int)g_rows.size(); ++i) g_rowHc[i] = CalcRowHeight(i, rc.right);
+            g_rowHcW = rc.right; g_rowHcDpi = g_dpiNow;
+        }
+        if (idx >= 0 && idx < (int)g_rowHc.size()) return g_rowHc[idx];
+    }
+    return g_rows[idx].s < 0 ? ROW_H : SUBROW_H;
+}
 static int RowsContentH() {
     int h = 0;
     for (int i = 0; i < (int)g_rows.size(); ++i) h += RowHeight(i);
@@ -1216,6 +1360,7 @@ static void DrawRow(HDC dc, int idx, int y, int w) {
     const RowRef& rr = g_rows[idx];
     const Task& t = g_tasks[rr.t];
     int h = RowHeight(idx);
+    int baseH = rr.s < 0 ? ROW_H : SUBROW_H;
     bool isSub = rr.s >= 0;
     const std::wstring& text = isSub ? t.subs[rr.s].text : t.text;
     const std::wstring& due = isSub ? t.subs[rr.s].due : t.due;
@@ -1230,9 +1375,9 @@ static void DrawRow(HDC dc, int idx, int y, int w) {
     if (isSub) { cbx = SC(26); tx = SC(46); }
     else {
         cbx = SC(8); tx = SC(40);
-        if (!t.subs.empty()) DrawTriangle(dc, SC(28), y + h / 2, t.expanded);
+        if (!t.subs.empty()) DrawTriangle(dc, SC(28), y + baseH / 2, t.expanded);   // 与首行对齐
     }
-    DrawCheckbox(dc, cbx, y + (h - SC(13)) / 2, done, g_hoverRow == idx);
+    DrawCheckbox(dc, cbx, y + (baseH - SC(13)) / 2, done, g_hoverRow == idx);   // 与首行对齐
 
     HFONT f = done ? (isSub ? fStrikeSub : fStrike) : (isSub ? fSub : fRow);
     HFONT of = (HFONT)SelectObject(dc, f);
@@ -1240,8 +1385,14 @@ static void DrawRow(HDC dc, int idx, int y, int w) {
     // 仅当确实要显示截止日期时才在右侧保留日期列, 否则文字用满整行宽度
     bool showDue = !due.empty() && !done && DateState(due) != -2;
     int textRight = showDue ? w - SC(96) : w - SC(8);
-    RECT tr = { tx, y, textRight, y + h };
-    DrawTextW(dc, text.c_str(), -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    // 首行垂直位置与单行时一致 (基础行高居中), 超宽文本自动换行多行显示
+    RECT r1 = { tx, 0, textRight, 0 };
+    DrawTextW(dc, L"Mg", -1, &r1, DT_SINGLELINE | DT_CALCRECT);
+    int vpad = (baseH - r1.bottom) / 2; if (vpad < 0) vpad = 0;
+    std::wstring wrapped;
+    WrapText(dc, text, textRight - tx, &wrapped);
+    RECT tr = { tx, y + vpad, textRight, y + h };
+    DrawTextW(dc, wrapped.c_str(), -1, &tr, DT_WORDBREAK);
     SelectObject(dc, of);
 
     if (showDue) {
@@ -1251,7 +1402,7 @@ static void DrawRow(HDC dc, int idx, int y, int w) {
         SetTextColor(dc, c);
         DrawTextW(dc, due.c_str(), -1, &dr, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS);
     }
-    if (done) {  // 删除线
+    if (done && h == baseH) {  // 删除线 (多行折行时字体自带逐行删除线, 不再画横线)
         HFONT tmp = (HFONT)SelectObject(dc, isSub ? fSub : fRow);
         SIZE sz; GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &sz);
         SelectObject(dc, tmp);
@@ -1409,12 +1560,75 @@ struct DlgCtx {
     std::vector<SubTask> tmpSubs;
     std::wstring pend1, pend2, pend3, pend4;   // 编辑框初值 (创建前设置)
     int pendKeep = 7, pendHours = 4, pendBkMode = 0; bool pendSync = false;
+    int e1H = 22;                                          // 任务内容输入框高度 (文本长时自动增高, 创建前计算)
     bool pendChk = false;
+    std::wstring pendTitle;                                // 自绘消息框: 标题栏文本
+    bool pendYesNo = false;                                // 自绘消息框: false=单个"确定" true=是/否
+    bool resultPosted = false;                             // 已投递结果 (用于区分 × 关闭时丢弃挂起回调)
     std::string previewBody; std::wstring prevName; bool previewOk = false;   // 恢复对话框: 已下载的备份
     std::vector<std::wstring> diffs; std::vector<Task> cloudTasks; std::wstring bkName;   // 启动差异提示: 云端较新
     bool isSync = false;                                   // 差异提示: 实时同步模式 (取消=保留本地并上传)
 };
+// 通用自绘消息框挂起回调 (DLG_CONFIRM 关闭且确认时执行; true=确定/是)
+static std::function<void(bool)> g_pendMsgCb;
+static void OpenMsgBox(HWND owner, const std::wstring& title, const std::wstring& msg, bool yesNo, std::function<void(bool)> cb);   // 前置声明 (定义在托盘区之后)
 #define PROP_CTX L"mt_ctx"
+#define PROP_OLDPROC L"mt_oldproc"   // 普通编辑框子类化前的原窗口过程
+
+// Ctrl+A 诊断日志 (默认关闭): 编译时加 -DMT_DEBUG 才输出到 exe 同目录 mt_debug.log (UTF-8)
+#ifdef MT_DEBUG
+static void DbgLog(const wchar_t* fmt, ...) {
+    wchar_t buf[1024] = {};
+    va_list ap; va_start(ap, fmt);
+    vswprintf(buf, 1024, fmt, ap);
+    va_end(ap);
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t line[1200];
+    wsprintfW(line, L"[%02d:%02d:%02d.%03d] %ls\r\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+    int n = WideCharToMultiByte(CP_UTF8, 0, line, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return;
+    std::string out(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, line, -1, &out[0], n, nullptr, nullptr);
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring p(exe);
+    size_t s = p.find_last_of(L"\\/");
+    std::wstring path = (s == std::wstring::npos) ? L"mt_debug.log" : p.substr(0, s + 1) + L"mt_debug.log";
+    HANDLE hf = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    SetFilePointer(hf, 0, nullptr, FILE_END);
+    DWORD w = 0;
+    WriteFile(hf, out.data(), (DWORD)out.size() - 1, &w, nullptr);
+    CloseHandle(hf);
+}
+#define MTLOG(...) DbgLog(__VA_ARGS__)
+#else
+#define MTLOG(...)   // 正常构建: 零开销空操作
+#endif
+
+// 普通编辑框子类化: 补充 Ctrl+A 全选 (标准 EDIT 无此快捷键; Ctrl+C/X/V 系统已内置)
+// Ctrl+A 的可能消息链 (按到达顺序, 全覆盖):
+//   1) WM_KEYDOWN(VK_A)          — 正常路径
+//   2) WM_KEYDOWN(VK_PROCESSKEY) — IME 拦截了按键, 原始虚拟键经 ImmGetVirtualKey 还原
+//   3) WM_CHAR(0x01)             — TranslateMessage 兜底生成 (IME 未拦截时必有)
+static LRESULT CALLBACK EditStdProc(HWND e, UINT m, WPARAM wp, LPARAM lp) {
+    bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    bool alt  = (GetKeyState(VK_MENU) & 0x8000) != 0;
+    if (m == WM_KEYDOWN && ctrl && wp != VK_PROCESSKEY)
+        MTLOG(L"WM_KEYDOWN vk=0x%02X ctrl=1 alt=%d", (int)wp, alt ? 1 : 0);
+    if (m == WM_KEYDOWN && wp == VK_PROCESSKEY)
+        MTLOG(L"WM_KEYDOWN VK_PROCESSKEY ctrl=%d 原始键=0x%04X", ctrl ? 1 : 0, ImmGetVirtualKey(e));
+    if (m == WM_KEYDOWN && ctrl && !alt) {
+        UINT vk = (wp == VK_PROCESSKEY) ? (UINT)ImmGetVirtualKey(e) : (UINT)wp;
+        if (vk == 'A') { SendMessageW(e, EM_SETSEL, 0, -1); MTLOG(L"Ctrl+A -> EM_SETSEL (KEYDOWN路径)"); return 0; }
+    }
+    if (m == WM_CHAR) {
+        if (wp < 0x20) MTLOG(L"WM_CHAR wp=0x%02X ctrl=%d", (int)wp, ctrl ? 1 : 0);
+        if (wp == 1) { SendMessageW(e, EM_SETSEL, 0, -1); MTLOG(L"Ctrl+A -> EM_SETSEL (WM_CHAR兜底)"); return 0; }
+    }
+    WNDPROC old = (WNDPROC)GetPropW(e, PROP_OLDPROC);
+    return old ? CallWindowProcW(old, e, m, wp, lp) : DefWindowProcW(e, m, wp, lp);
+}
 
 // 快捷键捕获框子类化: 按下组合键即显示
 static LRESULT CALLBACK HkEditProc(HWND e, UINT m, WPARAM wp, LPARAM lp) {
@@ -1510,17 +1724,17 @@ static void DavPreviewBackup(DlgCtx* c, int sel) {
 // 打开恢复对话框: 先列出远端备份, 再弹出选择窗口
 static void OpenDavRestoreDialog(HWND owner) {
     if (Trim(g_webdavUrl).empty()) {
-        MessageBoxW(owner, L"请先在 WebDAV 配置中填写服务器地址并保存。", APP_NAME, MB_ICONINFORMATION);
+        OpenMsgBox(owner, APP_NAME, L"请先在 WebDAV 配置中填写服务器地址并保存。", false, nullptr);
         return;
     }
     g_davBackups.clear();
     std::wstring err = WebDavListBackups(g_davBackups);
     if (!err.empty()) {
-        MessageBoxW(owner, (L"获取备份列表失败:\n" + err).c_str(), APP_NAME, MB_ICONWARNING);
+        OpenMsgBox(owner, APP_NAME, L"获取备份列表失败:\n" + err, false, nullptr);
         return;
     }
     if (g_davBackups.empty()) {
-        MessageBoxW(owner, (L"备份文件夹 " + g_webdavDir + L" 中还没有备份文件。").c_str(), APP_NAME, MB_ICONINFORMATION);
+        OpenMsgBox(owner, APP_NAME, L"备份文件夹 " + g_webdavDir + L" 中还没有备份文件。", false, nullptr);
         return;
     }
     DlgCtx* c = new DlgCtx();
@@ -1574,7 +1788,7 @@ static void DlgOnSave(DlgCtx* c) {
         if (!md.empty() && !sd.empty() && DueCmp(sd, md) > 0) {
             std::wstring msg = L"子任务截止日期 (" + sd + L") 晚于主任务截止日期 (" + md +
                                L"), 请调整后再保存。";
-            MessageBoxW(c->h, msg.c_str(), APP_NAME, MB_OK | MB_ICONWARNING);
+            OpenMsgBox(c->h, APP_NAME, msg, false, nullptr);   // 子任务截止日期晚于主任务
             SetFocus(c->e2);
             return;   // 保持窗口打开
         }
@@ -1586,7 +1800,7 @@ static void DlgOnSave(DlgCtx* c) {
                 if (!s.due.empty() && DueCmp(s.due, md) > 0) {
                     std::wstring msg = L"子任务 \"" + s.text + L"\" 的截止日期 (" + s.due +
                                        L") 晚于主任务截止日期 (" + md + L"), 请调整后再保存。";
-                    MessageBoxW(c->h, msg.c_str(), APP_NAME, MB_OK | MB_ICONWARNING);
+                    OpenMsgBox(c->h, APP_NAME, msg, false, nullptr);   // 子任务截止日期晚于主任务
                     SetFocus(c->e2);
                     return;   // 保持窗口打开
                 }
@@ -1608,29 +1822,56 @@ static void DlgOnSave(DlgCtx* c) {
     if (c->mode == DLG_DAVREST) {
         int sel = c->list ? (int)SendMessageW(c->list, LB_GETCURSEL, 0, 0) : -1;
         if (sel < 0 || sel >= (int)g_davBackups.size()) {
-            MessageBoxW(c->h, L"请先在列表中选择一个备份。", APP_NAME, MB_ICONINFORMATION);
+            OpenMsgBox(c->h, APP_NAME, L"请先在列表中选择一个备份。", false, nullptr);
             return;   // 未选中, 保持窗口打开
         }
         if (!c->previewOk) {
-            MessageBoxW(c->h, L"当前备份内容无效或未成功预览, 无法恢复。", APP_NAME, MB_ICONWARNING);
+            OpenMsgBox(c->h, APP_NAME, L"当前备份内容无效或未成功预览, 无法恢复。", false, nullptr);
             return;
         }
         r->taskIdx = sel;
         r->fbody = c->previewBody;   // 复用预览时已下载的内容, 避免二次下载
     }
     PostMessageW(c->owner, WM_APP_DLG, 0, (LPARAM)r);
+    c->resultPosted = true;
     DestroyWindow(c->h);
 }
 static void DlgOnCreate(DlgCtx* c) {
+    MTLOG(L"DlgOnCreate mode=%d", (int)c->mode);
+    // 任务/子任务内容输入框: 文本较长时自动增高为多行编辑框, 弹窗同步增高 (上限约 12 行后内部滚动)
+    c->e1H = SC(22);
+    if (c->mode == DLG_ADDTASK || c->mode == DLG_SUBTASK || c->mode == DLG_EDITTASK) {
+        RECT rc0; GetClientRect(c->h, &rc0);
+        int availW = rc0.right - SC(98) - SC(8);   // 输入框可用文本宽度 (减内边距)
+        HDC dc = GetDC(g_hwnd);
+        HFONT of = (HFONT)SelectObject(dc, fUI);
+        RECT r1 = { 0, 0, 0, 0 };
+        DrawTextW(dc, L"Mg", -1, &r1, DT_SINGLELINE | DT_CALCRECT);
+        int lines = WrapText(dc, c->pend1, availW, nullptr);
+        SelectObject(dc, of); ReleaseDC(g_hwnd, dc);
+        int four = 4 * r1.bottom + SC(10);          // 默认 4 行高度
+        int want = lines * r1.bottom + SC(10);
+        if (want < four) want = four;
+        if (want > SC(210)) want = SC(210);
+        c->e1H = want;
+        int extra = want - SC(22);
+        if (extra > 0) {   // 弹窗整体增高, 底部按钮等控件按新高度布局
+            RECT wr; GetWindowRect(c->h, &wr);
+            SetWindowPos(c->h, nullptr, 0, 0, wr.right - wr.left, wr.bottom - wr.top + extra,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
     HINSTANCE hi = GetModuleHandleW(nullptr);
     RECT rc; GetClientRect(c->h, &rc);
     int w = rc.right, h = rc.bottom;
     auto label = [&](const wchar_t* txt, int x, int y, int cw) -> HWND {
         return CreateWindowExW(0, L"STATIC", txt, WS_CHILD | WS_VISIBLE, x, y, cw, SC(18), c->h, nullptr, hi, nullptr);
     };
-    auto edit = [&](int id, int x, int y, int cw, DWORD extra = 0) {
-        return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | extra,
-                               x, y, cw, SC(22), c->h, (HMENU)(INT_PTR)id, hi, nullptr);
+    auto edit = [&](int id, int x, int y, int cw, DWORD extra = 0, int chh = SC(22)) {
+        DWORD st = WS_CHILD | WS_VISIBLE | WS_TABSTOP | extra;
+        if (!(extra & ES_MULTILINE)) st |= ES_AUTOHSCROLL;   // 多行时自动换行, 不做水平滚动
+        return CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", st,
+                               x, y, cw, chh, c->h, (HMENU)(INT_PTR)id, hi, nullptr);
     };
     auto btn = [&](const wchar_t* txt, int id, int x, int y, int cw) -> HWND {
         return CreateWindowExW(0, L"BUTTON", txt, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
@@ -1638,12 +1879,49 @@ static void DlgOnCreate(DlgCtx* c) {
     };
     c->closeRc = { w - SC(28), SC(3), w - SC(8), DLG_TOP - SC(3) };
 
-    if (c->mode == DLG_ADDTASK || c->mode == DLG_SUBTASK) {
+    if (c->mode == DLG_CONFIRM) {
+        // 自绘消息框: 消息多行标签 (长行按宽度预折行) + 确定/是/否 按钮, 高度按行数自适应
+        HDC dc = GetDC(c->h);
+        HFONT of = (HFONT)SelectObject(dc, fUI);
+        RECT r1 = { 0, 0, 0, 0 };
+        DrawTextW(dc, L"Mg", -1, &r1, DT_SINGLELINE | DT_CALCRECT);
+        int availW = w - SC(36);
+        int lines = 0;
+        std::wstring msgText;
+        size_t start = 0;
+        while (true) {   // WrapText 不识别 \n, 先按 \n 分段各自折行再拼接
+            size_t p = c->pend1.find(L'\n', start);
+            std::wstring seg = (p == std::wstring::npos) ? c->pend1.substr(start) : c->pend1.substr(start, p - start);
+            std::wstring wseg;
+            int ln = WrapText(dc, seg, availW, &wseg);
+            if (ln < 1) ln = 1;
+            lines += ln;
+            if (!msgText.empty()) msgText += L'\n';
+            msgText += wseg.empty() ? seg : wseg;
+            if (p == std::wstring::npos) break;
+            start = p + 1;
+        }
+        SelectObject(dc, of); ReleaseDC(c->h, dc);
+        int textH = lines * r1.bottom;
+        int wantH = DLG_TOP + SC(14) + textH + SC(18) + SC(24) + SC(14);
+        SetWindowPos(c->h, nullptr, 0, 0, w, wantH, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        h = wantH;
+        CreateWindowExW(0, L"STATIC", msgText.c_str(), WS_CHILD | WS_VISIBLE | SS_LEFT,
+                        SC(18), DLG_TOP + SC(14), availW, textH + SC(4), c->h, nullptr, hi, nullptr);
+        if (c->pendYesNo) {
+            btn(L"是", IDOK, w / 2 - SC(72), h - SC(38), SC(66));
+            btn(L"否", IDCANCEL, w / 2 + SC(6), h - SC(38), SC(66));
+        } else {
+            btn(L"确定", IDOK, w / 2 - SC(33), h - SC(38), SC(66));
+        }
+    } else if (c->mode == DLG_ADDTASK || c->mode == DLG_SUBTASK) {
         const wchar_t* l1 = c->mode == DLG_ADDTASK ? L"任务内容:" : L"子任务内容:";
         label(l1, SC(10), DLG_TOP + SC(12), SC(72));
-        c->e1 = edit(IDC_E1, SC(88), DLG_TOP + SC(10), w - SC(98));
-        label(L"截止日期 (YYYY-MM-DD, 留空为无):", SC(10), DLG_TOP + SC(42), w - SC(20));
-        c->e2 = edit(IDC_E2, SC(88), DLG_TOP + SC(60), w - SC(98));
+        c->e1 = edit(IDC_E1, SC(88), DLG_TOP + SC(10), w - SC(98),
+                     ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL, c->e1H);   // 多行自动换行, 高度随内容
+        int dateY = DLG_TOP + SC(10) + c->e1H + SC(10);   // 后续控件随内容框高度顺移
+        label(L"截止日期 (YYYY-MM-DD, 留空为无):", SC(10), dateY + SC(2), w - SC(20));
+        c->e2 = edit(IDC_E2, SC(88), dateY + SC(20), w - SC(98));
         btn(L"保存", IDOK, w - SC(152), h - SC(36), SC(66));
         btn(L"取消", IDCANCEL, w - SC(78), h - SC(36), SC(66));
         SetWindowTextW(c->e1, c->pend1.c_str());
@@ -1651,13 +1929,16 @@ static void DlgOnCreate(DlgCtx* c) {
         SetFocus(c->e1);
     } else if (c->mode == DLG_EDITTASK) {
         label(L"任务内容:", SC(10), DLG_TOP + SC(12), SC(72));
-        c->e1 = edit(IDC_E1, SC(88), DLG_TOP + SC(10), w - SC(98));
-        label(L"截止日期 (YYYY-MM-DD, 留空为无):", SC(10), DLG_TOP + SC(42), w - SC(20));
-        c->e2 = edit(IDC_E2, SC(88), DLG_TOP + SC(60), w - SC(98));
-        label(L"子任务列表 (双击切换完成状态):", SC(10), DLG_TOP + SC(92), w - SC(20));
+        c->e1 = edit(IDC_E1, SC(88), DLG_TOP + SC(10), w - SC(98),
+                     ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL, c->e1H);   // 多行自动换行, 高度随内容
+        int dateY = DLG_TOP + SC(10) + c->e1H + SC(10);   // 后续控件随内容框高度顺移
+        label(L"截止日期 (YYYY-MM-DD, 留空为无):", SC(10), dateY + SC(2), w - SC(20));
+        c->e2 = edit(IDC_E2, SC(88), dateY + SC(20), w - SC(98));
+        int subY = dateY + SC(50);   // 子任务区起点
+        label(L"子任务列表 (双击编辑子任务):", SC(10), subY, w - SC(20));
         c->list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
-                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-                                  SC(10), DLG_TOP + SC(108), w - SC(20), h - DLG_TOP - SC(200), c->h, (HMENU)(INT_PTR)IDC_LIST, hi, nullptr);
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWVARIABLE | LBS_HASSTRINGS,
+                                  SC(10), subY + SC(16), w - SC(20), h - subY - SC(108), c->h, (HMENU)(INT_PTR)IDC_LIST, hi, nullptr);
         btn(L"添加子任务", IDC_ADDSUB, SC(10), h - SC(80), SC(80));
         btn(L"编辑", IDC_EDITSUB, SC(98), h - SC(80), SC(60));
         btn(L"删除", IDC_DELSUB, SC(166), h - SC(80), SC(60));
@@ -1670,7 +1951,7 @@ static void DlgOnCreate(DlgCtx* c) {
     } else if (c->mode == DLG_DAVREST) {
         label(L"选择备份 (点击条目自动预览内容):", SC(10), DLG_TOP + SC(8), w - SC(20));
         c->list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
-                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWVARIABLE | LBS_HASSTRINGS,
                                   SC(10), DLG_TOP + SC(26), w - SC(20), SC(110), c->h, (HMENU)(INT_PTR)IDC_LIST, hi, nullptr);
         label(L"备份内容预览:", SC(10), DLG_TOP + SC(144), SC(200));
         c->e1 = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -1754,7 +2035,7 @@ static void DlgOnCreate(DlgCtx* c) {
                                      SC(140), cy + SC(271), SC(36), SC(22), c->h, (HMENU)(INT_PTR)IDC_HOURS, hi, nullptr);
         c->pg1.push_back(c->bkRb0); c->pg1.push_back(c->bkRb1); c->pg1.push_back(c->bkRb2); c->pg1.push_back(c->hoursEd);
         c->pg1.push_back(label(L"小时", SC(184), cy + SC(275), SC(60)));
-        HWND restBtn = btn(L"浏览备份并恢复…", IDC_REST, SC(10), cy + SC(306), SC(130));
+        HWND restBtn = btn(L"浏览备份并恢复…", IDC_REST, SC(10), h - SC(36), SC(130));
         c->pg1.push_back(restBtn);
         SendMessage(c->bkRb0, BM_SETCHECK, c->pendBkMode == 0 ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessage(c->bkRb1, BM_SETCHECK, c->pendBkMode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -1785,7 +2066,7 @@ static void DlgOnCreate(DlgCtx* c) {
             : L"云端备份 " + c->bkName + L" 比本地记录更新 (可能来自其他电脑):";
         label(head.c_str(), SC(10), DLG_TOP + SC(8), w - SC(20));
         c->list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
-                                  WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOINTEGRALHEIGHT,
+                                  WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWVARIABLE | LBS_HASSTRINGS,
                                   SC(10), DLG_TOP + SC(32), w - SC(20), h - DLG_TOP - SC(108),
                                   c->h, (HMENU)(INT_PTR)IDC_LIST, hi, nullptr);
         for (auto& d : c->diffs)
@@ -1793,10 +2074,21 @@ static void DlgOnCreate(DlgCtx* c) {
         btn(L"用云端覆盖本地", IDOK, w - SC(228), h - SC(36), SC(116));
         btn(c->isSync ? L"保留本地上传" : L"保留本地记录", IDCANCEL, w - SC(104), h - SC(36), SC(94));
     }
+    // 统一设置字体; 普通编辑框子类化补充 Ctrl+A 全选 (热键捕获框有自己的子类处理, 排除)
     EnumChildWindows(c->h, [](HWND ch, LPARAM lp) -> BOOL {
-        SendMessageW(ch, WM_SETFONT, (WPARAM)lp, TRUE);
+        wchar_t cls[16] = {};
+        GetClassNameW(ch, cls, 16);
+        SendMessageW(ch, WM_SETFONT, (WPARAM)fUI, TRUE);
+        if (!_wcsicmp(cls, L"edit")) {   // 系统类名为混合大小写 "Edit", 必须不区分大小写比较
+            DlgCtx* ctx = (DlgCtx*)lp;
+            if (ch != ctx->hkey) {
+                SetPropW(ch, PROP_OLDPROC, (HANDLE)GetWindowLongPtrW(ch, GWLP_WNDPROC));
+                SetWindowLongPtrW(ch, GWLP_WNDPROC, (LONG_PTR)EditStdProc);
+                MTLOG(L"SUBCLASS 安装 hwnd=%p mode=%d", (void*)ch, (int)ctx->mode);
+            }
+        }
         return TRUE;
-    }, (LPARAM)fUI);
+    }, (LPARAM)c);
 }
 static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     DlgCtx* c = (DlgCtx*)GetPropW(h, PROP_CTX);
@@ -1826,7 +2118,7 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_APP_DLG: {   // 子任务编辑结果 (owner 为编辑任务对话框时)
         DlgResult* r = (DlgResult*)lp;
         if (r->ok && r->mode == DLG_SUBTASK && c->mode == DLG_EDITTASK) {
-            SubTask s; s.text = Trim(r->f1); s.due = Trim(r->f2);
+            SubTask s; s.text = OneLine(Trim(r->f1)); s.due = Trim(r->f2);
             if (r->subIdx >= 0 && r->subIdx < (int)c->tmpSubs.size()) {
                 if (!s.text.empty()) c->tmpSubs[r->subIdx] = s;
             } else if (!s.text.empty()) {
@@ -1836,6 +2128,58 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
         delete r;
         return 0;
+    }
+    // 列表条目动态高度: 长文本换行显示 (自绘 LISTBOX)
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* mi = (MEASUREITEMSTRUCT*)lp;
+        if (c && mi && mi->CtlType == ODT_LISTBOX) {
+            HWND lb = GetDlgItem(h, (int)mi->CtlID);   // MEASUREITEMSTRUCT 无 hwndItem, 经控件 ID 取句柄
+            if (!lb) break;
+            int n = (int)SendMessageW(lb, LB_GETTEXTLEN, mi->itemID, 0);
+            std::wstring s;
+            if (n > 0) { s.resize(n); SendMessageW(lb, LB_GETTEXT, mi->itemID, (LPARAM)&s[0]); }
+            RECT rc; GetClientRect(lb, &rc);
+            HDC dc = GetDC(lb);
+            HFONT of = (HFONT)SelectObject(dc, fUI);
+            RECT r1 = { 0, 0, 0, 0 };
+            DrawTextW(dc, L"Mg", -1, &r1, DT_SINGLELINE | DT_CALCRECT);
+            int availW = rc.right - rc.left - SC(28);   // 与 DRAW 侧可用宽度一致 (含滚动条与内边距)
+            int lines = s.empty() ? 1 : WrapText(dc, s, availW, nullptr);
+            SelectObject(dc, of); ReleaseDC(lb, dc);
+            mi->itemHeight = lines * r1.bottom + SC(8);
+            if (mi->itemHeight < SC(18)) mi->itemHeight = SC(18);
+            return TRUE;
+        }
+        break;
+    }
+    // 自绘 LISTBOX 条目: 长文本自动换行, 完成项灰色+删除线
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* di = (DRAWITEMSTRUCT*)lp;
+        if (c && di && di->CtlType == ODT_LISTBOX && di->itemID != (UINT)-1) {
+            int n = (int)SendMessageW(di->hwndItem, LB_GETTEXTLEN, di->itemID, 0);
+            std::wstring s;
+            if (n > 0) { s.resize(n); SendMessageW(di->hwndItem, LB_GETTEXT, di->itemID, (LPARAM)&s[0]); }
+            bool sel = (di->itemState & ODS_SELECTED) != 0;
+            bool done = s.rfind(L"[✓] ", 0) == 0;   // ComposeSubItem 的完成前缀
+            FillRect(di->hDC, &di->rcItem, CachedBrush(sel ? RGB(204, 232, 255) : RGB(255, 255, 255)));
+            if (!s.empty()) {
+                HDC dc = di->hDC;
+                HFONT f = done ? fStrike : fUI;
+                HFONT of = (HFONT)SelectObject(dc, f);
+                SetTextColor(dc, done ? RGB(130, 130, 130) : RGB(15, 15, 15));
+                SetBkMode(dc, TRANSPARENT);
+                int tx = di->rcItem.left + SC(8);
+                int availW = di->rcItem.right - tx - SC(8);
+                std::wstring wrapped;
+                WrapText(dc, s, availW, &wrapped);
+                RECT tr = { tx, di->rcItem.top + SC(4), di->rcItem.right - SC(8), di->rcItem.bottom };
+                DrawTextW(dc, wrapped.c_str(), -1, &tr, DT_WORDBREAK);
+                SelectObject(dc, of);
+            }
+            if (di->itemState & ODS_FOCUS) DrawFocusRect(di->hDC, &di->rcItem);
+            return TRUE;
+        }
+        break;
     }
     case WM_COMMAND: {
         int id = LOWORD(wp);
@@ -1853,6 +2197,11 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
         if (c->mode == DLG_EDITTASK) {
             int sel = (int)SendMessage(c->list, LB_GETCURSEL, 0, 0);
+            if (id == IDC_LIST && HIWORD(wp) == LBN_DBLCLK && sel >= 0) {
+                MTLOG(L"LBN_DBLCLK sel=%d -> OpenSubDialog", sel);
+                OpenSubDialog(h, c->taskIdx, sel, c->tmpSubs[sel].text, c->tmpSubs[sel].due);   // 双击子任务 = 编辑弹窗
+                return 0;
+            }
             if (id == IDC_ADDSUB) {
                 OpenSubDialog(h, c->taskIdx, -1, L"", L"");
             } else if (id == IDC_EDITSUB && sel >= 0) {
@@ -1880,33 +2229,36 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if (c->mode == DLG_DAVREST && id == IDC_DELB) {
             int sel = (int)SendMessageW(c->list, LB_GETCURSEL, 0, 0);
             if (sel < 0 || sel >= (int)g_davBackups.size()) {
-                MessageBoxW(c->h, L"请先在列表中选择要删除的备份。", APP_NAME, MB_ICONINFORMATION);
+                OpenMsgBox(c->h, APP_NAME, L"请先在列表中选择要删除的备份。", false, nullptr);
                 return 0;
             }
             std::wstring msg = L"确定删除备份 " + g_davBackups[sel] + L" ?\n删除后不可恢复。";
-            if (MessageBoxW(c->h, msg.c_str(), L"删除备份", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
-                return 0;
-            SetCursor(LoadCursor(nullptr, IDC_WAIT));
-            DWORD code = 0;
-            std::wstring err = WebDavRequest(L"DELETE", DavPath(g_davBackups[sel]), nullptr, nullptr, &code);
-            SetCursor(LoadCursor(nullptr, IDC_ARROW));
-            if (!err.empty() && code != 404) {
-                MessageBoxW(c->h, (L"删除失败: " + err).c_str(), APP_NAME, MB_ICONWARNING);
-                return 0;
-            }
-            SendMessageW(c->list, LB_DELETESTRING, sel, 0);
-            g_davBackups.erase(g_davBackups.begin() + sel);
-            c->previewOk = false; c->prevName.clear();
-            SetWindowTextW(c->e1, L"");
-            int count = (int)g_davBackups.size();
-            if (count == 0) {
-                MessageBoxW(c->h, L"最后一个备份已删除。", APP_NAME, MB_ICONINFORMATION);
-                DestroyWindow(c->h);
-            } else {
-                if (sel >= count) sel = count - 1;
-                SendMessageW(c->list, LB_SETCURSEL, sel, 0);
-                DavPreviewBackup(c, sel);
-            }
+            int delSel = sel;
+            OpenMsgBox(c->h, L"删除备份", msg, true, [c, delSel](bool ok) {
+                if (!ok) return;
+                SetCursor(LoadCursor(nullptr, IDC_WAIT));
+                DWORD code = 0;
+                std::wstring err = WebDavRequest(L"DELETE", DavPath(g_davBackups[delSel]), nullptr, nullptr, &code);
+                SetCursor(LoadCursor(nullptr, IDC_ARROW));
+                if (!err.empty() && code != 404) {
+                    OpenMsgBox(c->h, APP_NAME, L"删除失败: " + err, false, nullptr);
+                    return;
+                }
+                SendMessageW(c->list, LB_DELETESTRING, delSel, 0);
+                g_davBackups.erase(g_davBackups.begin() + delSel);
+                c->previewOk = false; c->prevName.clear();
+                SetWindowTextW(c->e1, L"");
+                int count = (int)g_davBackups.size();
+                if (count == 0) {
+                    OpenMsgBox(c->h, APP_NAME, L"最后一个备份已删除。", false, nullptr);
+                    DestroyWindow(c->h);
+                } else {
+                    int ns = (delSel >= count) ? count - 1 : delSel;
+                    SendMessageW(c->list, LB_SETCURSEL, ns, 0);
+                    DavPreviewBackup(c, ns);
+                }
+            });
+            return 0;
         }
         return 0;
     }
@@ -2024,6 +2376,7 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_DESTROY: {
         if (c && c->owner && c->mode != DLG_COLORPOP) EnableWindow(c->owner, TRUE);   // 恢复属主窗口 (气泡非模态, 未禁用)
         if (c && c->mode == DLG_BKDIFF) g_syncDialogOpen = false;   // 恢复同步轮询
+        if (c && c->mode == DLG_CONFIRM && !c->resultPosted) g_pendMsgCb = nullptr;   // × / 否 关闭: 丢弃挂起回调, 防止下次误触发
         RemovePropW(h, PROP_CTX);
         delete c;
         return 0;
@@ -2031,6 +2384,7 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     default:
         return DefWindowProcW(h, m, wp, lp);
     }
+    return 0;   // break 出 switch 的消息路径
 }
 
 // 打开子任务编辑对话框 (owner 为主窗口或编辑任务对话框)
@@ -2074,10 +2428,44 @@ static void ToggleVisible() {
     if (IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd)) ShowWindow(g_hwnd, SW_HIDE);
     else { ShowWindow(g_hwnd, SW_SHOW); SetForegroundWindow(g_hwnd); }
 }
+// 通用自绘消息弹窗 (替代系统 MessageBox, 与应用风格一致: g_bg 背景 + 自绘标题栏 + fUI 字体, 居中于 owner 前方)
+// yesNo=false: 单个"确定"按钮 (纯提示); yesNo=true: 是/否 (确认); cb 在弹窗确认后回调, × / 否 时不回调
+static void OpenMsgBox(HWND owner, const std::wstring& title, const std::wstring& msg, bool yesNo, std::function<void(bool)> cb) {
+    DlgCtx* c = new DlgCtx();
+    c->mode = DLG_CONFIRM; c->owner = owner;
+    c->taskIdx = -1;
+    c->pend1 = msg;
+    c->pendTitle = title;
+    c->pendYesNo = yesNo;
+    g_pendMsgCb = std::move(cb);
+    CreateWindowExW(0, L"MTDlg", title.c_str(),
+                    WS_POPUP, 0, 0, SC(300), SC(180), owner, nullptr, GetModuleHandleW(nullptr), c);
+}
 static void ToggleTask(int rowIdx) {
     const RowRef& rr = g_rows[rowIdx];
     Task& t = g_tasks[rr.t];
-    if (rr.s < 0) t.done = !t.done;
+    if (rr.s < 0) {
+        if (!t.done) {   // 勾选主任务完成: 若有未完成的子任务, 先弹自绘确认框
+            int pending = 0;
+            for (auto& s : t.subs) if (!s.done) ++pending;
+            if (pending > 0) {
+                wchar_t msg[256];
+                wsprintfW(msg, L"该任务还有 %d 个未完成的子任务。\n\n确认将主任务标记为完成？\n(确认后所有子任务将一并标记为完成)", pending);
+                OpenMsgBox(g_hwnd, L"确认", msg, true, [rowIdx](bool ok) {
+                    if (!ok || rowIdx < 0 || rowIdx >= (int)g_rows.size()) return;
+                    const RowRef& rr2 = g_rows[rowIdx];
+                    if (rr2.s < 0 && rr2.t >= 0 && rr2.t < (int)g_tasks.size()) {
+                        Task& t2 = g_tasks[rr2.t];
+                        t2.done = true;
+                        for (auto& s : t2.subs) s.done = true;   // 用户确认: 所有子任务一并完成
+                        SaveAppData(); RebuildRows();
+                    }
+                });   // 确认结果异步回调
+                return;
+            }
+        }
+        t.done = !t.done;
+    }
     else t.subs[rr.s].done = !t.subs[rr.s].done;
     SaveAppData();
     RebuildRows();
@@ -2116,7 +2504,7 @@ static void OpenSettingsDialog() {
     c->pend4 = g_webdavDir; c->pendKeep = g_webdavKeepDays;
     c->pendHours = g_wdBkHours; c->pendBkMode = g_wdBkMode; c->pendSync = g_wdSync != 0;
     CreateWindowExW(0, L"MTDlg", L"设置",
-                    WS_POPUP, 0, 0, SC(420), SC(400), g_hwnd, nullptr, GetModuleHandleW(nullptr), c);
+                    WS_POPUP, 0, 0, SC(420), SC(408), g_hwnd, nullptr, GetModuleHandleW(nullptr), c);
 }
 // 颜色气泡: 锚定在顶栏颜色按钮下方, 非模态, 即点即生效
 static void OpenColorPopup() {
@@ -2146,8 +2534,14 @@ static void OpenColorPopup() {
 static void HandleDlgResult(DlgResult* r) {
     if (r->ok) {
         switch (r->mode) {
+        case DLG_CONFIRM: {   // 自绘消息框: 执行挂起回调 (true=确定/是; × / 否 不进入)
+            auto cb = std::move(g_pendMsgCb);
+            g_pendMsgCb = nullptr;
+            if (cb) cb(r->ok);
+            break;
+        }
         case DLG_ADDTASK: {
-            std::wstring txt = Trim(r->f1);
+            std::wstring txt = OneLine(Trim(r->f1));
             if (!txt.empty()) {
                 Task t; t.text = txt; t.due = Trim(r->f2);
                 g_tasks.insert(g_tasks.begin(), std::move(t));
@@ -2159,7 +2553,7 @@ static void HandleDlgResult(DlgResult* r) {
         case DLG_EDITTASK: {
             if (r->taskIdx >= 0 && r->taskIdx < (int)g_tasks.size()) {
                 Task& t = g_tasks[r->taskIdx];
-                std::wstring txt = Trim(r->f1);
+                std::wstring txt = OneLine(Trim(r->f1));
                 if (!txt.empty()) t.text = txt;
                 t.due = Trim(r->f2);
                 t.subs = r->subs;
@@ -2170,7 +2564,7 @@ static void HandleDlgResult(DlgResult* r) {
         case DLG_SUBTASK: {   // owner 为主窗口: 直接修改数据
             if (r->taskIdx >= 0 && r->taskIdx < (int)g_tasks.size()) {
                 Task& t = g_tasks[r->taskIdx];
-                SubTask s; s.text = Trim(r->f1); s.due = Trim(r->f2);
+                SubTask s; s.text = OneLine(Trim(r->f1)); s.due = Trim(r->f2);
                 if (r->subIdx >= 0 && r->subIdx < (int)t.subs.size()) {
                     if (!s.text.empty()) t.subs[r->subIdx] = s;
                 } else if (!s.text.empty()) {
@@ -2206,7 +2600,7 @@ static void HandleDlgResult(DlgResult* r) {
                     g_hkMods = om; g_hkVk = ov;
                     g_hkStr = FormatHotkey(om, ov);
                     ApplyHotkey();
-                    MessageBoxW(g_hwnd, L"快捷键注册失败, 可能被其他程序占用, 已恢复原快捷键。", APP_NAME, MB_OK | MB_ICONWARNING);
+                    OpenMsgBox(g_hwnd, APP_NAME, L"快捷键注册失败, 可能被其他程序占用, 已恢复原快捷键。", false, nullptr);
                 }
             }
             SaveAppData();
@@ -2216,20 +2610,21 @@ static void HandleDlgResult(DlgResult* r) {
         case DLG_DAVREST: {
             std::vector<Task> ts;
             if (!ParseTasksFromJson(r->fbody, ts)) {
-                MessageBoxW(g_hwnd, L"备份内容解析失败, 未恢复。", APP_NAME, MB_ICONWARNING);
+                OpenMsgBox(g_hwnd, APP_NAME, L"备份内容解析失败, 未恢复。", false, nullptr);
                 break;
             }
-            if (MessageBoxW(g_hwnd, L"将用备份内容覆盖当前全部任务清单, 是否继续?",
-                            L"恢复备份", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
-                break;
-            g_tasks = std::move(ts);
-            for (auto& t : g_tasks) t.expanded = false;
-            g_lastBackupSig = TasksSignature();   // 恢复的内容已存在于备份中, 退出时无需重复备份
-            SaveAppData();
-            RebuildRows();
-            UpdateTrayTip();
-            InvalidateRect(g_hwnd, nullptr, FALSE);
-            MessageBoxW(g_hwnd, L"恢复完成。", APP_NAME, MB_ICONINFORMATION);
+            OpenMsgBox(g_hwnd, L"恢复备份", L"将用备份内容覆盖当前全部任务清单, 是否继续?", true,
+                       [ts = std::move(ts)](bool ok) mutable {
+                if (!ok) return;
+                g_tasks = std::move(ts);
+                for (auto& t : g_tasks) t.expanded = false;
+                g_lastBackupSig = TasksSignature();   // 恢复的内容已存在于备份中, 退出时无需重复备份
+                SaveAppData();
+                RebuildRows();
+                UpdateTrayTip();
+                InvalidateRect(g_hwnd, nullptr, FALSE);
+                OpenMsgBox(g_hwnd, APP_NAME, L"恢复完成。", false, nullptr);
+            });
             break;
         }
         }
@@ -2268,10 +2663,9 @@ static void ShowTrayMenu() {
         if (err.empty()) {
             g_lastBackupSig = TasksSignature();   // 记录指纹, 退出时无变化则不再备份
             RotateBackups();
-            MessageBoxW(g_hwnd, (L"已备份为 " + g_webdavDir + L"/" + name).c_str(),
-                        APP_NAME, MB_OK | MB_ICONINFORMATION);
+            OpenMsgBox(g_hwnd, APP_NAME, L"已备份为 " + g_webdavDir + L"/" + name, false, nullptr);
         } else {
-            MessageBoxW(g_hwnd, (L"备份失败: " + err).c_str(), APP_NAME, MB_OK | MB_ICONWARNING);
+            OpenMsgBox(g_hwnd, APP_NAME, L"备份失败: " + err, false, nullptr);
         }
         break;
     }
@@ -2499,9 +2893,10 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if (row >= 0) {
             const RowRef& rr = g_rows[row];
             int rh = RowHeight(row);
+            int baseH = rr.s < 0 ? ROW_H : SUBROW_H;
             int yy = TOPBAR_H - g_scroll + RowTop(row);
             int cbx = rr.s < 0 ? SC(8) : SC(26);
-            RECT cb = { cbx, yy + (rh - SC(13)) / 2 - 1, cbx + SC(15), yy + (rh - SC(13)) / 2 + SC(15) };
+            RECT cb = { cbx, yy + (baseH - SC(13)) / 2 - 1, cbx + SC(15), yy + (baseH - SC(13)) / 2 + SC(15) };
             if (PtInRect(&cb, { x, y })) { ToggleTask(row); return 0; }
             if (rr.s < 0 && !g_tasks[rr.t].subs.empty()) {
                 RECT ar = { SC(20), yy, SC(36), yy + rh };
@@ -2708,18 +3103,22 @@ static void RecalcLayout() {
                         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Symbol");   // ⚙ 齿轮字形
 }
 
-// 取窗口所在屏幕的真实 DPI (GetDpiForMonitor, 系统重定位后仍准确)
-static UINT GetMonitorDpi(HWND h) {
+// 取指定屏幕的真实 DPI (GetDpiForMonitor, 系统重定位后仍准确)
+static UINT GetMonitorDpiOf(HMONITOR mon) {
     typedef HRESULT(WINAPI* PFN_GDM)(HMONITOR, int, UINT*, UINT*);
     static PFN_GDM gdm = nullptr;
     if (!gdm) {
         static HMODULE sh = LoadLibraryW(L"Shcore.dll");
         gdm = sh ? (PFN_GDM)GetProcAddress(sh, "GetDpiForMonitor") : nullptr;
     }
-    HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
     UINT dx = 0, dy = 0;
     if (gdm && mon && SUCCEEDED(gdm(mon, 0 /*MDT_EFFECTIVE_DPI*/, &dx, &dy)) && dx) return dx;
     return 0;
+}
+
+// 取窗口所在屏幕的真实 DPI (GetDpiForMonitor, 系统重定位后仍准确)
+static UINT GetMonitorDpi(HWND h) {
+    return GetMonitorDpiOf(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST));
 }
 
 // 取窗口当前生效的 DPI: 优先所在屏幕的真实 DPI (GetDpiForWindow 在系统重定位场景可能返回旧值)
@@ -2798,6 +3197,7 @@ static void FitWindowToScreen(HWND h) {
 
 // ---------------- 入口 ----------------
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
+    MTLOG(L"APP START ver=%ls", APP_VER);   // 启动日志 (诊断日志机制自检)
     // 进程 DPI 感知: 优先 Per-Monitor V2 (跨不同缩放率屏幕时经 WM_DPICHANGED 自动重缩放),
     // 不支持时回退 System Aware (跨屏需重启程序才能匹配)
     typedef BOOL(WINAPI* PFN_SetDpiAwarenessCtx)(HANDLE);
