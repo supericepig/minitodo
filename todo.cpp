@@ -30,9 +30,10 @@
 
 // ---------------- 常量 ----------------
 #define APP_NAME     L"MiniTodo"
-#define APP_VER      L"2.0.8"    // 每次功能修改后递增 (功能+0.1 / 修复+0.0.1)
+#define APP_VER      L"2.1.0"    // 每次功能修改后递增 (功能+0.1 / 修复+0.0.1)
 #define WM_APP_TRAY  (WM_APP + 1)   // 托盘回调
 #define WM_APP_DLG   (WM_APP + 2)   // 对话框结果 (lParam = new DlgResult)
+#define WM_APP_UPDCHECK (WM_APP + 3)   // 更新检查结果 (lParam = new UpdResult)
 
 // ---------------- DPI 缩放 ----------------
 static double g_s = 1.0;   // DPI 缩放系数 (96dpi=1.0)
@@ -69,7 +70,7 @@ enum { B_ADD = 1, B_TAB0, B_TAB1, B_PIN, B_OPM, B_OPTXT, B_OPP, B_CLOSE, B_SET, 
 // 对话框模式
 enum { DLG_ADDTASK = 1, DLG_EDITTASK, DLG_SUBTASK, DLG_SETTINGS, DLG_DAVREST, DLG_COLORPOP, DLG_BKDIFF, DLG_CONFIRM };
 // 对话框内部控件 ID
-enum { IDC_E1 = 200, IDC_E2, IDC_E3, IDC_LIST, IDC_ADDSUB, IDC_EDITSUB, IDC_DELSUB, IDC_CHKAUTO, IDC_HK, IDC_AUTO, IDC_FOLDER, IDC_KEEP, IDC_REST, IDC_DELB, IDC_BKMODE0, IDC_BKMODE1, IDC_BKMODE2, IDC_HOURS, IDC_SYNC };
+enum { IDC_E1 = 200, IDC_E2, IDC_E3, IDC_LIST, IDC_ADDSUB, IDC_EDITSUB, IDC_DELSUB, IDC_CHKAUTO, IDC_HK, IDC_AUTO, IDC_FOLDER, IDC_KEEP, IDC_REST, IDC_DELB, IDC_BKMODE0, IDC_BKMODE1, IDC_BKMODE2, IDC_HOURS, IDC_SYNC, IDC_CHKUPD, IDC_GH, IDC_CHKUPDCFG };
 #define BGCOUNT 9
 static int DLG_TOP = 30;   // 弹窗自绘标题栏高度 (96dpi 基准, WinMain 中缩放)
 
@@ -97,6 +98,15 @@ static int g_wdBkMode = 0;                       // 自动备份模式: 0=关 1=
 static int g_wdSync = 0;                         // 实时同步开关 (与备份相互独立): 1=多台电脑间保持一致
 static int g_wdBkHours = 4;                      // 定时备份间隔 (小时)
 static bool g_showStart = true;                  // 启动时显示主窗口
+// 自动更新检查 (GitHub Releases)
+static const wchar_t* kRepoUrl   = L"https://github.com/supericepig/minitodo";
+static const wchar_t* kRepoApi   = L"https://api.github.com/repos/supericepig/minitodo/releases/latest";
+static bool g_checkUpdate = true;                // 启动时检查更新
+static bool g_updNetFail = false;                // 上次启动检查因网络失败 (关于页提示用)
+static volatile bool g_updChecking = false;      // 检查进行中 (防重入)
+static bool g_updManual = false;                 // 当前检查是否手动触发
+struct UpdResult { bool netOk = false; std::wstring latestVer; };
+static void StartUpdateCheck(bool manual);   // 前置声明 (定义在自绘消息框之后)
 
 // 定时器 ID
 #define TIMER_AUTOBK_DEBOUNCE 2   // 实时备份防抖 (10 秒, 单次)
@@ -110,7 +120,7 @@ static UINT g_hkVk = 'M';
 static std::wstring g_hkStr = L"Ctrl+Alt+M";
 
 static HWND  g_hwnd = nullptr;
-static HFONT fUI, fRow, fSub, fStrike, fStrikeSub, fGear;
+static HFONT fUI, fRow, fSub, fStrike, fStrikeSub, fGear, fLink;
 static HICON g_icon;
 static UINT  g_msgTaskbarCreated;
 static NOTIFYICONDATAW g_nid = {};
@@ -481,8 +491,9 @@ static std::string SerializeApp() {
     sprintf(extra, ",\"lw\":%lld,\"lh\":%lld,\"dpi\":%lld,\"wax\":%lld,\"way\":%lld,\"waw\":%lld,\"wah\":%lld",
             lw, lh, sdpi, wax, way, waw, wah);   // 跨屏/跨 DPI 还原用 (v1.9+)
     o += extra;
-    sprintf(bg, ",\"bg\":\"%02X%02X%02X\",\"showstart\":%s}",
-            GetRValue(g_bg), GetGValue(g_bg), GetBValue(g_bg), g_showStart ? "true" : "false");
+    sprintf(bg, ",\"bg\":\"%02X%02X%02X\",\"showstart\":%s,\"checkupdate\":%s}",
+            GetRValue(g_bg), GetGValue(g_bg), GetBValue(g_bg),
+            g_showStart ? "true" : "false", g_checkUpdate ? "true" : "false");
     o += bg;
     o += ",\"webdav\":{\"url\":";  JsonEsc(g_webdavUrl, o);
     o += ",\"user\":";             JsonEsc(g_webdavUser, o);
@@ -571,6 +582,7 @@ static void LoadAppData() {
             UpdateBgBrush();
         }
         g_showStart = ui->boolOf(L"showstart", true);
+        g_checkUpdate = ui->boolOf(L"checkupdate", true);
         long long x = ui->intOf(L"x", 80), y = ui->intOf(L"y", 60);
         long long w = ui->intOf(L"w", SC(420)), h = ui->intOf(L"h", SC(560));
         long long lw = ui->intOf(L"lw", -1), lh = ui->intOf(L"lh", -1);   // 逻辑尺寸 (96dpi 基准, v1.9+)
@@ -1283,8 +1295,8 @@ static int HitButtonRect(int x, int y) {
 }
 
 // ---------------- 绘制 ----------------
-static HFONT MkFont(int h, bool strike, int weight = FW_SEMIBOLD) {
-    return CreateFontW(-SC(h), 0, 0, 0, weight, 0, 0, strike, DEFAULT_CHARSET,
+static HFONT MkFont(int h, bool strike, int weight = FW_SEMIBOLD, bool underline = false) {
+    return CreateFontW(-SC(h), 0, 0, 0, weight, 0, underline, strike, DEFAULT_CHARSET,
                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                        DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
 }
@@ -1539,6 +1551,7 @@ struct DlgResult {
     std::vector<SubTask> subs;
     int taskIdx = -1, subIdx = -1;
     UINT hkMods = 0, hkVk = 0;                             // 设置对话框: 快捷键
+    bool chkUpd = false;                                   // 设置对话框: 启动检查更新
 };
 struct DlgCtx {
     int mode = 0; HWND h = nullptr, owner = nullptr;
@@ -1547,6 +1560,8 @@ struct DlgCtx {
     HWND e4 = nullptr, keepEd = nullptr;                   // WebDAV: 备份文件夹 / 保留天数
     HWND bkRb0 = nullptr, bkRb1 = nullptr, bkRb2 = nullptr, syncChk = nullptr, hoursEd = nullptr, showChk = nullptr;   // 备份策略 / 实时同步 / 启动显示
     HWND chkAuto = nullptr;                                // 设置: 开机自启
+    HWND chkUpd = nullptr;                                 // 设置: 启动检查更新
+    HWND updBtn = nullptr, updStatus = nullptr, updLink = nullptr;   // 关于: 检查更新按钮 / 状态文本 / GitHub 链接
     UINT pMods = 0, pVk = 0;                               // 捕获到的快捷键
     int selBg = -1;                                        // 选中的背景色
     RECT sw[BGCOUNT];                                      // 色块矩形
@@ -1560,6 +1575,7 @@ struct DlgCtx {
     std::vector<SubTask> tmpSubs;
     std::wstring pend1, pend2, pend3, pend4;   // 编辑框初值 (创建前设置)
     int pendKeep = 7, pendHours = 4, pendBkMode = 0; bool pendSync = false;
+    bool pendUpdChk = true;                                // 设置: 启动检查更新初值
     int e1H = 22;                                          // 任务内容输入框高度 (文本长时自动增高, 创建前计算)
     bool pendChk = false;
     std::wstring pendTitle;                                // 自绘消息框: 标题栏文本
@@ -1818,6 +1834,7 @@ static void DlgOnSave(DlgCtx* c) {
         // 开机自启: 保存时写注册表, 与托盘菜单保持同步 (菜单每次读取注册表实时状态)
         if (c->chkAuto)
             SetAutoStart(SendMessage(c->chkAuto, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        r->chkUpd = c->chkUpd && SendMessageW(c->chkUpd, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (c->mode == DLG_DAVREST) {
         int sel = c->list ? (int)SendMessageW(c->list, LB_GETCURSEL, 0, 0) : -1;
@@ -1982,16 +1999,40 @@ static void DlgOnCreate(DlgCtx* c) {
                                      SC(10), cy + SC(46), SC(300), SC(20), c->h, (HMENU)(INT_PTR)IDC_AUTO, hi, nullptr);
         SendMessage(c->chkAuto, BM_SETCHECK, GetAutoStart() ? BST_CHECKED : BST_UNCHECKED, 0);
         c->pg0.push_back(c->chkAuto);
+        c->chkUpd = CreateWindowExW(0, L"BUTTON", L"启动时检查更新 (发现新版本时提示)",
+                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                    SC(10), cy + SC(70), SC(300), SC(20), c->h, (HMENU)(INT_PTR)IDC_CHKUPDCFG, hi, nullptr);
+        SendMessage(c->chkUpd, BM_SETCHECK, c->pendUpdChk ? BST_CHECKED : BST_UNCHECKED, 0);
+        c->pg0.push_back(c->chkUpd);
         // ---- 页 2: 关于 ----
         c->pg2.push_back(label(L"MiniTodo —— 极简待办清单", SC(10), cy + SC(10), w - SC(20)));
         std::wstring vInfo = std::wstring(L"版本: ") + APP_VER;
-        c->pg2.push_back(label(vInfo.c_str(), SC(10), cy + SC(44), w - SC(20)));
+        c->pg2.push_back(label(vInfo.c_str(), SC(10), cy + SC(38), w - SC(20)));
         std::wstring bInfo = L"编译日期: " + BuildStamp();
-        c->pg2.push_back(label(bInfo.c_str(), SC(10), cy + SC(70), w - SC(20)));
-        c->pg2.push_back(label(L"纯 Win32 API 单文件程序, 无外部依赖", SC(10), cy + SC(112), w - SC(20)));
-        c->pg2.push_back(label(L"数据保存在程序目录 todo.json (含 .bak 滚动备份)", SC(10), cy + SC(138), w - SC(20)));
-        c->pg2.push_back(label(L"WebDAV 备份: /miniTodo/todo-日期-时间.json", SC(10), cy + SC(164), w - SC(20)));
-        c->pg2.push_back(label(L"实时同步主文件: /miniTodo/state.json", SC(10), cy + SC(190), w - SC(20)));
+        c->pg2.push_back(label(bInfo.c_str(), SC(10), cy + SC(60), w - SC(20)));
+        // GitHub 项目链接 (蓝色下划线, 点击跳转浏览器)
+        c->updLink = CreateWindowExW(0, L"STATIC", kRepoUrl,
+                                     WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_LEFT,
+                                     SC(10), cy + SC(84), w - SC(20), SC(22), c->h, (HMENU)(INT_PTR)IDC_GH, hi, nullptr);
+        SendMessageW(c->updLink, WM_SETFONT, (WPARAM)fLink, TRUE);
+        c->pg2.push_back(c->updLink);
+        // 检查更新状态文本 (启动检查网络失败 / 手动检查结果显示于此)
+        const wchar_t* initStatus = g_updChecking ? L"检查更新中…"
+                                  : g_updNetFail ? L"上次启动检查更新失败 (无法访问 GitHub)"
+                                  : L"";
+        c->updStatus = CreateWindowExW(0, L"STATIC", initStatus,
+                                       WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                       SC(10), cy + SC(108), w - SC(20), SC(22), c->h, nullptr, hi, nullptr);
+        SendMessageW(c->updStatus, WM_SETFONT, (WPARAM)fUI, TRUE);
+        c->pg2.push_back(c->updStatus);
+        // 手动检查更新按钮
+        c->updBtn = btn(L"检查更新", IDC_CHKUPD, SC(10), cy + SC(134), SC(90));
+        c->pg2.push_back(c->updBtn);
+        if (g_updChecking) { SetWindowTextW(c->updBtn, L"检查更新中…"); EnableWindow(c->updBtn, FALSE); }
+        c->pg2.push_back(label(L"纯 Win32 API 单文件程序, 无外部依赖", SC(10), cy + SC(168), w - SC(20)));
+        c->pg2.push_back(label(L"数据保存在程序目录 todo.json (含 .bak 滚动备份)", SC(10), cy + SC(192), w - SC(20)));
+        c->pg2.push_back(label(L"WebDAV 备份: /miniTodo/todo-日期-时间.json", SC(10), cy + SC(216), w - SC(20)));
+        c->pg2.push_back(label(L"实时同步主文件: /miniTodo/state.json", SC(10), cy + SC(240), w - SC(20)));
         // ---- 页 1: WebDAV ----
         c->pg1.push_back(label(L"WebDAV 地址 (目录, 如 https://dav.example.com/dav/):", SC(10), cy + SC(10), w - SC(20)));
         c->e1 = edit(IDC_E1, SC(10), cy + SC(28), w - SC(20));
@@ -2215,6 +2256,17 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             OpenDavRestoreDialog(h);   // 属主为设置窗口, 关闭后自动恢复其可用状态
             return 0;
         }
+        if (c->mode == DLG_SETTINGS && id == IDC_GH && HIWORD(wp) == STN_CLICKED) {
+            ShellExecuteW(nullptr, L"open", kRepoUrl, nullptr, nullptr, SW_SHOWNOACTIVATE);   // 跳转 GitHub 项目页
+            return 0;
+        }
+        if (c->mode == DLG_SETTINGS && id == IDC_CHKUPD && HIWORD(wp) == BN_CLICKED) {
+            SetWindowTextW(c->updBtn, L"检查更新中…");
+            EnableWindow(c->updBtn, FALSE);
+            SetWindowTextW(c->updStatus, L"检查更新中…");
+            StartUpdateCheck(true);   // 结果经 WM_APP_UPDCHECK 处理
+            return 0;
+        }
         if (c->mode == DLG_COLORPOP && id == IDC_CHKAUTO && HIWORD(wp) == BN_CLICKED) {
             g_showStart = SendMessage(c->showChk, BM_GETCHECK, 0, 0) != BST_CHECKED;
             SaveAppData();
@@ -2364,15 +2416,18 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) DestroyWindow(h);
         return 0;
-    case WM_CTLCOLORSTATIC: {   // 标签文字背景与窗口背景一致
+    case WM_CTLCOLORSTATIC: {   // 标签文字背景与窗口背景一致 (GitHub 链接为蓝色)
         HDC dc = (HDC)wp;
         SetBkColor(dc, g_bg);
-        SetTextColor(dc, RGB(25, 25, 25));
+        SetTextColor(dc, (c && (HWND)lp == c->updLink) ? RGB(6, 90, 190) : RGB(25, 25, 25));
         return (LRESULT)(g_bgBrush ? g_bgBrush : GetStockObject(WHITE_BRUSH));
     }
-    case WM_SETCURSOR:
-        SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    case WM_SETCURSOR: {
+        POINT pt; GetCursorPos(&pt);
+        HWND wh = WindowFromPoint(pt);
+        SetCursor(LoadCursor(nullptr, (c && wh == c->updLink) ? IDC_HAND : IDC_ARROW));
         return TRUE;
+    }
     case WM_DESTROY: {
         if (c && c->owner && c->mode != DLG_COLORPOP) EnableWindow(c->owner, TRUE);   // 恢复属主窗口 (气泡非模态, 未禁用)
         if (c && c->mode == DLG_BKDIFF) g_syncDialogOpen = false;   // 恢复同步轮询
@@ -2441,6 +2496,99 @@ static void OpenMsgBox(HWND owner, const std::wstring& title, const std::wstring
     CreateWindowExW(0, L"MTDlg", title.c_str(),
                     WS_POPUP, 0, 0, SC(300), SC(180), owner, nullptr, GetModuleHandleW(nullptr), c);
 }
+
+// ---------------- 自动更新检查 (GitHub Releases, 后台线程) ----------------
+#include <process.h>
+
+// 版本比较: tag 形如 "2.0.9"/"v2.0.9"; true=比当前 APP_VER 新
+static bool VerNewer(const std::wstring& tag) {
+    std::wstring v = tag;
+    if (!v.empty() && (v[0] == L'v' || v[0] == L'V')) v.erase(0, 1);
+    auto nums = [](const std::wstring& s) {
+        std::vector<int> a;
+        size_t st = 0;
+        while (true) {
+            size_t p = s.find(L'.', st);
+            a.push_back(_wtoi(s.substr(st, p == std::wstring::npos ? std::wstring::npos : p - st).c_str()));
+            if (p == std::wstring::npos) break;
+            st = p + 1;
+        }
+        return a;
+    };
+    auto a = nums(v), b = nums(APP_VER);
+    size_t n = std::max(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+        int x = i < a.size() ? a[i] : 0, y = i < b.size() ? b[i] : 0;
+        if (x != y) return x > y;
+    }
+    return false;
+}
+
+// HTTPS GET 文本 (5 秒超时; GitHub API 强制要求 User-Agent)
+static bool HttpGetText(const wchar_t* url, std::wstring* out) {
+    *out = L"";
+    URL_COMPONENTSW uc = { sizeof(uc) };
+    wchar_t host[256] = {}, path[512] = {};
+    uc.lpszHostName = host; uc.dwHostNameLength = 255;
+    uc.lpszUrlPath = path; uc.dwUrlPathLength = 511;
+    if (!WinHttpCrackUrl(url, 0, 0, &uc)) return false;
+    bool ok = false;
+    HINTERNET ses = WinHttpOpen(L"MiniTodo", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (ses) {
+        WinHttpSetTimeouts(ses, 5000, 5000, 5000, 5000);
+        HINTERNET con = WinHttpConnect(ses, host, uc.nPort, 0);
+        if (con) {
+            HINTERNET req = WinHttpOpenRequest(con, L"GET", path, nullptr, WINHTTP_NO_REFERER,
+                                               WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                               (uc.nPort == INTERNET_DEFAULT_HTTPS_PORT) ? WINHTTP_FLAG_SECURE : 0);
+            if (req) {
+                if (WinHttpSendRequest(req, L"User-Agent: MiniTodo\r\n", -1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+                    && WinHttpReceiveResponse(req, nullptr)) {
+                    DWORD status = 0, sz = sizeof(status);
+                    WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &sz, nullptr);
+                    if (status == 200) {
+                        std::string body; char buf[4096]; DWORD rd = 0;
+                        while (WinHttpReadData(req, buf, sizeof(buf), &rd) && rd > 0) body.append(buf, rd);
+                        *out = U8W(body);
+                        ok = true;
+                    }
+                }
+                WinHttpCloseHandle(req);
+            }
+            WinHttpCloseHandle(con);
+        }
+        WinHttpCloseHandle(ses);
+    }
+    return ok;
+}
+
+// 检查线程: 请求 releases/latest, 提取 tag_name, 结果投递主窗口 (WM_APP_UPDCHECK)
+static unsigned __stdcall UpdateCheckThreadProc(void*) {
+    std::wstring body;
+    bool netOk = HttpGetText(kRepoApi, &body);
+    UpdResult* rs = new UpdResult();
+    if (netOk) {
+        const wchar_t* key = L"\"tag_name\":";
+        size_t p = body.find(key);
+        size_t s = (p == std::wstring::npos) ? std::wstring::npos : p + wcslen(key);
+        while (s != std::wstring::npos && s < body.size() && body[s] == L' ') ++s;   // 兼容带空格的 JSON
+        size_t q1 = (s == std::wstring::npos || s >= body.size()) ? std::wstring::npos : body.find(L'"', s);
+        size_t q2 = (q1 == std::wstring::npos) ? std::wstring::npos : body.find(L'"', q1 + 1);
+        if (q2 == std::wstring::npos) netOk = false;
+        else rs->latestVer = body.substr(q1 + 1, q2 - q1 - 1);
+    }
+    rs->netOk = netOk;
+    PostMessageW(g_hwnd, WM_APP_UPDCHECK, 0, (LPARAM)rs);
+    return 0;
+}
+
+// 发起更新检查 (manual=手动触发): 进行中则忽略; 结果经 WM_APP_UPDCHECK 统一处理
+static void StartUpdateCheck(bool manual) {
+    if (g_updChecking) return;
+    g_updChecking = true; g_updManual = manual;
+    HANDLE th = (HANDLE)_beginthreadex(nullptr, 0, UpdateCheckThreadProc, nullptr, 0, nullptr);
+    if (th) CloseHandle(th);
+}
 static void ToggleTask(int rowIdx) {
     const RowRef& rr = g_rows[rowIdx];
     Task& t = g_tasks[rr.t];
@@ -2503,6 +2651,7 @@ static void OpenSettingsDialog() {
     c->pend1 = g_webdavUrl; c->pend2 = g_webdavUser; c->pend3 = g_webdavPass;
     c->pend4 = g_webdavDir; c->pendKeep = g_webdavKeepDays;
     c->pendHours = g_wdBkHours; c->pendBkMode = g_wdBkMode; c->pendSync = g_wdSync != 0;
+    c->pendUpdChk = g_checkUpdate;
     CreateWindowExW(0, L"MTDlg", L"设置",
                     WS_POPUP, 0, 0, SC(420), SC(408), g_hwnd, nullptr, GetModuleHandleW(nullptr), c);
 }
@@ -2591,6 +2740,7 @@ static void HandleDlgResult(DlgResult* r) {
             if (g_webdavKeepDays > 365) g_webdavKeepDays = 365;
             if (g_wdBkHours < 1) g_wdBkHours = 1;
             if (g_wdBkHours > 24) g_wdBkHours = 24;
+            g_checkUpdate = r->chkUpd;   // 启动时检查更新开关
             // 快捷键 (仅当用户重新捕获了组合键才应用; 注册失败则回退, 提示冲突)
             if (r->hkMods && r->hkVk) {
                 UINT om = g_hkMods, ov = g_hkVk;
@@ -2764,6 +2914,36 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_APP_DLG:
         HandleDlgResult((DlgResult*)lp);
         return 0;
+    case WM_APP_UPDCHECK: {   // 更新检查结果 (后台线程投递)
+        UpdResult* rs = (UpdResult*)lp;
+        g_updChecking = false;
+        bool manual = g_updManual;
+        if (!rs->netOk && !manual) g_updNetFail = true;
+        if (rs->netOk) g_updNetFail = false;
+        // 更新关于页状态文本与按钮 (设置弹窗打开时)
+        HWND setDlg = FindWindowW(L"MTDlg", L"设置");
+        DlgCtx* sc = setDlg ? (DlgCtx*)GetPropW(setDlg, PROP_CTX) : nullptr;
+        if (sc && sc->mode == DLG_SETTINGS && sc->updBtn && sc->updStatus) {
+            SetWindowTextW(sc->updBtn, L"检查更新");
+            EnableWindow(sc->updBtn, TRUE);
+            if (!rs->netOk)            SetWindowTextW(sc->updStatus, L"检查失败: 无法访问 GitHub (网络问题)");
+            else if (VerNewer(rs->latestVer))
+                SetWindowTextW(sc->updStatus, (std::wstring(L"发现新版本 ") + rs->latestVer + L" (当前 " + APP_VER + L")").c_str());
+            else                       SetWindowTextW(sc->updStatus, L"已是最新版本");
+        }
+        bool hasNew = rs->netOk && VerNewer(rs->latestVer);
+        if (hasNew) {
+            std::wstring msg = std::wstring(L"发现新版本 ") + rs->latestVer + L" (当前 " + APP_VER + L")。\n\n是否前往下载页？";
+            OpenMsgBox(g_hwnd, L"检查更新", msg, true, [](bool ok) {
+                if (ok) ShellExecuteW(nullptr, L"open", (std::wstring(kRepoUrl) + L"/releases").c_str(), nullptr, nullptr, SW_SHOWNOACTIVATE);
+            });
+        } else if (manual) {
+            if (rs->netOk) OpenMsgBox(g_hwnd, APP_NAME, std::wstring(L"当前已是最新版本 (") + APP_VER + L")。", false, nullptr);
+            else           OpenMsgBox(g_hwnd, APP_NAME, L"检查更新失败: 无法访问 GitHub。\n请检查网络后重试。", false, nullptr);
+        }
+        delete rs;
+        return 0;
+    }
     case WM_ACTIVATE:   // 激活时自检: 切换主屏/投影模式后系统未必发 DPICHANGED
         if (LOWORD(wp) != WA_INACTIVE) CheckDisplayFit(h);
         return 0;
@@ -3092,12 +3272,14 @@ static void RecalcLayout() {
     if (fSub) DeleteObject(fSub);
     if (fStrike) DeleteObject(fStrike);
     if (fStrikeSub) DeleteObject(fStrikeSub);
+    if (fLink) DeleteObject(fLink);
     if (fGear) DeleteObject(fGear);
     fUI = MkFont(12, false);
     fRow = MkFont(13, false);
     fSub = MkFont(12, false);
     fStrike = MkFont(13, true);
     fStrikeSub = MkFont(12, true);
+    fLink = MkFont(12, false, FW_SEMIBOLD, true);   // GitHub 链接: 蓝色由 WM_CTLCOLORSTATIC 控制, 字体带下划线
     fGear = CreateFontW(-SC(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Symbol");   // ⚙ 齿轮字形
@@ -3269,6 +3451,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
         ShowWindow(h, SW_SHOW);
         UpdateWindow(h);
     }
+    // 启动时检查更新 (可开关; 后台线程不阻塞, 结果经 WM_APP_UPDCHECK 提示)
+    if (g_checkUpdate) StartUpdateCheck(false);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
