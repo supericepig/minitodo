@@ -1,6 +1,12 @@
 # minitodo
 minitodo极简待办任务清单
 
+2026-11-12：
+增加自动检测新版本功能，可以设置启动时检测，也可以手动检测。</br>
+<img width="420" height="408" alt="image" src="https://github.com/user-attachments/assets/d6bcec37-d8d0-4e62-aabe-4e392b3fa4d9" /> 
+
+<img width="420" height="408" alt="image" src="https://github.com/user-attachments/assets/e1199672-14d0-4f8c-992f-e3e451a54b75" /></br>
+
 2026-11-09：
 
 1、增加了长文本任务换行显示。
