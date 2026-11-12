@@ -27,13 +27,16 @@
 #include <cstdio>
 #include <cstdarg>
 #include <functional>
+#include <deque>
+#include <process.h>
 
 // ---------------- 常量 ----------------
 #define APP_NAME     L"MiniTodo"
-#define APP_VER      L"2.1.0"    // 每次功能修改后递增 (功能+0.1 / 修复+0.0.1)
+#define APP_VER      L"2.1.1"    // 每次功能修改后递增 (功能+0.1 / 修复+0.0.1)
 #define WM_APP_TRAY  (WM_APP + 1)   // 托盘回调
 #define WM_APP_DLG   (WM_APP + 2)   // 对话框结果 (lParam = new DlgResult)
 #define WM_APP_UPDCHECK (WM_APP + 3)   // 更新检查结果 (lParam = new UpdResult)
+#define WM_APP_DAVJOB   (WM_APP + 4)   // 后台 WebDAV 任务结果 (lParam = new DavJobResult)
 
 // ---------------- DPI 缩放 ----------------
 static double g_s = 1.0;   // DPI 缩放系数 (96dpi=1.0)
@@ -741,22 +744,31 @@ static std::string B64(const std::string& in) {
     else if (rem == 2) { v <<= 8; out += tbl[(v >> 18) & 63]; out += tbl[(v >> 12) & 63]; out += tbl[(v >> 6) & 63]; out += "="; }
     return out;
 }
+// WebDAV 配置快照: 后台线程只读副本, 避免跨线程读取会被用户修改的全局配置
+struct DavConf { std::wstring url, user, pass, dir; int keepDays = 7; };
+static DavConf SnapDav() {
+    DavConf c;
+    c.url = g_webdavUrl; c.user = g_webdavUser; c.pass = g_webdavPass;
+    c.dir = g_webdavDir; c.keepDays = g_webdavKeepDays;
+    return c;
+}
 // 通用 WebDAV 请求: 成功返回空串, 否则为错误信息; resp/codeOut 可为空
 // extraHdr: 附加 HTTP 头 (CRLF 结尾, 如 MOVE 的 Destination)
-static std::wstring WebDavRequest(const wchar_t* verb, const std::wstring& remotePath,
+// cfg 按值快照传入: 可在后台线程安全调用
+static std::wstring WebDavRequest(const DavConf& cfg, const wchar_t* verb, const std::wstring& remotePath,
                                   const std::string* send, std::string* resp, DWORD* codeOut,
                                   const char* extraHdr = nullptr) {
     if (codeOut) *codeOut = 0;
-    if (Trim(g_webdavUrl).empty()) return L"未配置 WebDAV 地址";
+    if (Trim(cfg.url).empty()) return L"未配置 WebDAV 地址";
     URL_COMPONENTSW uc = {};
     uc.dwStructSize = sizeof(uc);
     uc.dwSchemeLength = uc.dwHostNameLength = (DWORD)-1;
-    if (!WinHttpCrackUrl(g_webdavUrl.c_str(), 0, 0, &uc)) return L"WebDAV 地址格式错误";
+    if (!WinHttpCrackUrl(cfg.url.c_str(), 0, 0, &uc)) return L"WebDAV 地址格式错误";
     std::wstring host(uc.lpszHostName, uc.dwHostNameLength);
 
     std::string auth;
-    if (!g_webdavUser.empty() || !g_webdavPass.empty())
-        auth = "Authorization: Basic " + B64(WU8(g_webdavUser) + ":" + WU8(g_webdavPass)) + "\r\n";
+    if (!cfg.user.empty() || !cfg.pass.empty())
+        auth = "Authorization: Basic " + B64(WU8(cfg.user) + ":" + WU8(cfg.pass)) + "\r\n";
 
     std::wstring err;
     HINTERNET hs = WinHttpOpen(APP_NAME L"/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -803,15 +815,15 @@ static std::wstring WebDavRequest(const wchar_t* verb, const std::wstring& remot
     return err;
 }
 // 远端路径: <URL路径>/<备份文件夹>/<文件名>  (fname 为空表示文件夹本身)
-static std::wstring DavPath(const std::wstring& fname) {
+static std::wstring DavPath(const DavConf& cfg, const std::wstring& fname) {
     URL_COMPONENTSW uc = {};
     uc.dwStructSize = sizeof(uc);
     uc.dwUrlPathLength = uc.dwExtraInfoLength = (DWORD)-1;
     std::wstring path;
-    if (WinHttpCrackUrl(g_webdavUrl.c_str(), 0, 0, &uc))
+    if (WinHttpCrackUrl(cfg.url.c_str(), 0, 0, &uc))
         path.assign(uc.lpszUrlPath, uc.dwUrlPathLength);
     while (!path.empty() && path.back() == L'/') path.pop_back();
-    std::wstring dir = g_webdavDir;
+    std::wstring dir = cfg.dir;
     while (!dir.empty() && (dir.front() == L'/' || dir.front() == L'\\')) dir.erase(0, 1);
     while (!dir.empty() && (dir.back() == L'/' || dir.back() == L'\\')) dir.pop_back();
     if (!dir.empty()) path += L"/" + dir;
@@ -827,17 +839,17 @@ static std::wstring BackupFileName() {
     return buf;
 }
 // 上传备份 (先确保文件夹存在); 返回空串表示成功
-static std::wstring WebDavUploadBackup(const std::string& body, const std::wstring& fname) {
+static std::wstring WebDavUploadBackup(const DavConf& cfg, const std::string& body, const std::wstring& fname) {
     DWORD code = 0;
-    WebDavRequest(L"MKCOL", DavPath(L""), nullptr, nullptr, &code);   // 已存在时服务器报 405, 忽略
-    return WebDavRequest(L"PUT", DavPath(fname), &body, nullptr, &code);
+    WebDavRequest(cfg, L"MKCOL", DavPath(cfg, L""), nullptr, nullptr, &code);   // 已存在时服务器报 405, 忽略
+    return WebDavRequest(cfg, L"PUT", DavPath(cfg, fname), &body, nullptr, &code);
 }
 // 列出备份文件 (按时间新→旧排序)
-static std::wstring WebDavListBackups(std::vector<std::wstring>& out) {
+static std::wstring WebDavListBackups(const DavConf& cfg, std::vector<std::wstring>& out) {
     out.clear();
     std::string resp;
     DWORD code = 0;
-    std::wstring err = WebDavRequest(L"PROPFIND", DavPath(L""), nullptr, &resp, &code);
+    std::wstring err = WebDavRequest(cfg, L"PROPFIND", DavPath(cfg, L""), nullptr, &resp, &code);
     if (!err.empty()) return err;
     if (code != 207 && code != 200) return L"服务器返回状态码 " + std::to_wstring(code);
     std::wstring w = U8W(resp);
@@ -860,33 +872,33 @@ static std::wstring WebDavListBackups(std::vector<std::wstring>& out) {
     std::sort(out.begin(), out.end(), std::greater<std::wstring>());
     return L"";
 }
-static std::wstring WebDavDownload(const std::wstring& fname, std::string& body) {
+static std::wstring WebDavDownload(const DavConf& cfg, const std::wstring& fname, std::string& body) {
     DWORD code = 0;
-    return WebDavRequest(L"GET", DavPath(fname), nullptr, &body, &code);
+    return WebDavRequest(cfg, L"GET", DavPath(cfg, fname), nullptr, &body, &code);
 }
 // 构造远端文件的完整 URL (MOVE 的 Destination 头要求绝对地址)
-static std::wstring DavFullUrl(const std::wstring& fname) {
+static std::wstring DavFullUrl(const DavConf& cfg, const std::wstring& fname) {
     URL_COMPONENTSW uc = {};
     uc.dwStructSize = sizeof(uc);
     uc.dwSchemeLength = uc.dwHostNameLength = uc.dwUrlPathLength = uc.dwExtraInfoLength = (DWORD)-1;
-    if (!WinHttpCrackUrl(g_webdavUrl.c_str(), 0, 0, &uc)) return DavPath(fname);   // 解析失败退回相对路径
+    if (!WinHttpCrackUrl(cfg.url.c_str(), 0, 0, &uc)) return DavPath(cfg, fname);   // 解析失败退回相对路径
     std::wstring full = std::wstring(uc.lpszScheme, uc.dwSchemeLength) + L"://"
                       + std::wstring(uc.lpszHostName, uc.dwHostNameLength);
     if ((uc.nScheme == INTERNET_SCHEME_HTTPS && uc.nPort != 443)
         || (uc.nScheme == INTERNET_SCHEME_HTTP && uc.nPort != 80))
         full += L":" + std::to_wstring(uc.nPort);
-    return full + DavPath(fname);
+    return full + DavPath(cfg, fname);
 }
 // 上传实时同步主文件 state.json: 先 PUT 到 state.tmp 再 MOVE 原子替换,
 // 避免其他机器 GET 到写了一半的内容; MOVE 不被支持时回退为直接覆盖 PUT
-static std::wstring WebDavUploadState(const std::string& body) {
-    WebDavRequest(L"MKCOL", DavPath(L""), nullptr, nullptr, nullptr);   // 已存在时 405, 忽略
-    std::wstring err = WebDavRequest(L"PUT", DavPath(L"state.tmp"), &body, nullptr, nullptr);
+static std::wstring WebDavUploadState(const DavConf& cfg, const std::string& body) {
+    WebDavRequest(cfg, L"MKCOL", DavPath(cfg, L""), nullptr, nullptr, nullptr);   // 已存在时 405, 忽略
+    std::wstring err = WebDavRequest(cfg, L"PUT", DavPath(cfg, L"state.tmp"), &body, nullptr, nullptr);
     if (!err.empty()) return err;
-    std::wstring dest = L"Destination: " + DavFullUrl(L"state.json") + L"\r\nOverwrite: T\r\n";
-    err = WebDavRequest(L"MOVE", DavPath(L"state.tmp"), nullptr, nullptr, nullptr, WU8(dest).c_str());
+    std::wstring dest = L"Destination: " + DavFullUrl(cfg, L"state.json") + L"\r\nOverwrite: T\r\n";
+    err = WebDavRequest(cfg, L"MOVE", DavPath(cfg, L"state.tmp"), nullptr, nullptr, nullptr, WU8(dest).c_str());
     if (err.empty()) return L"";
-    return WebDavRequest(L"PUT", DavPath(L"state.json"), &body, nullptr, nullptr);   // 回退: 直接覆盖
+    return WebDavRequest(cfg, L"PUT", DavPath(cfg, L"state.json"), &body, nullptr, nullptr);   // 回退: 直接覆盖
 }
 // 从备份文件名解析日期 (todo-YYYYMMDD-...) -> FILETIME 当天零点; 失败返回 false
 static bool BackupFileDate(const std::wstring& name, FILETIME& ft) {
@@ -910,10 +922,10 @@ static bool BackupFileDateTime(const std::wstring& name, FILETIME& ft) {
     return SystemTimeToFileTime(&st, &ft) != 0;
 }
 // 清理超过保留天数的备份 (按文件名中的日期计算)
-static void RotateBackups() {
-    if (Trim(g_webdavUrl).empty()) return;
+static void RotateBackups(const DavConf& cfg) {
+    if (Trim(cfg.url).empty()) return;
     std::vector<std::wstring> files;
-    if (!WebDavListBackups(files).empty()) return;
+    if (!WebDavListBackups(cfg, files).empty()) return;
     SYSTEMTIME now;
     GetLocalTime(&now);
     now.wHour = now.wMinute = now.wSecond = now.wMilliseconds = 0;
@@ -923,8 +935,8 @@ static void RotateBackups() {
         FILETIME ft;
         if (!BackupFileDate(f, ft)) continue;   // 无法识别日期的文件不动
         long long ageSec = (*(long long*)&ftNow - *(long long*)&ft) / 10000000LL;
-        if (ageSec > (long long)g_webdavKeepDays * 86400)
-            WebDavRequest(L"DELETE", DavPath(f), nullptr, nullptr, nullptr);
+        if (ageSec > (long long)cfg.keepDays * 86400)
+            WebDavRequest(cfg, L"DELETE", DavPath(cfg, f), nullptr, nullptr, nullptr);
     }
 }
 // ---------------- 自动备份 ----------------
@@ -961,30 +973,182 @@ static std::vector<std::wstring> BuildTaskDiff(const std::vector<Task>& loc, con
 static void OpenBkDiffDialog(HWND owner, const std::vector<std::wstring>& diffs,
                              const std::vector<Task>& cloudTasks, const std::wstring& bkName,
                              bool isSync = false);   // 定义在对话框框架之后
-// 实时同步推送: 本地有未上传的修改时, 序列化任务清单覆盖云端 state.json
-static void DoSyncPush() {
-    if (!g_wdSync || Trim(g_webdavUrl).empty()) return;
+static void OpenMsgBox(HWND owner, const std::wstring& title, const std::wstring& msg, bool yesNo,
+                       std::function<void(bool)> cb);   // 前置声明 (定义在托盘区之后)
+// ============ 后台 WebDAV 任务队列 ============
+// 同步/备份的网络 I/O 全部在后台线程执行, UI 线程只做"快照数据 -> 入队"和"结果回主线程应用",
+// 避免 WinHTTP 超时等待 (单次最长 5+5+5+10 秒) 卡死界面
+enum { DAVJOB_SYNCPOLL = 1, DAVJOB_SYNCPUSH, DAVJOB_BACKUP, DAVJOB_START, DAVJOB_MANUALBK };
+struct DavJob {
+    int kind = 0;
+    DavConf cfg;
+    std::string body, sig;   // 上传内容 / 内容指纹 (回主线程后记录)
+    std::wstring fname;
+    int bkMode = 0;
+    bool sync = false;
+};
+struct DavJobResult {
+    int kind = 0;
+    bool netOk = false;
+    DWORD code = 0;
+    std::wstring err, fname, dirName;
+    std::string body, sig;
+    std::vector<std::wstring> files;
+    int bkMode = 0;
+    bool sync = false;
+};
+static std::deque<DavJob> g_davQ;
+static CRITICAL_SECTION g_davCs;
+static bool g_davCsInit = false;
+static HANDLE g_davEvt = nullptr, g_davThread = nullptr;
+static volatile bool g_davStop = false;
+// 防重入: 同类任务进行中不再重复入队 (轮询/推送/备份各自独立)
+static bool g_pollPending = false, g_pushPending = false, g_bkPending = false;
+
+// 后台线程: 串行执行队列中的网络任务, 结果 PostMessage 回主窗口
+static unsigned __stdcall DavWorkerProc(void*) {
+    for (;;) {
+        WaitForSingleObject(g_davEvt, INFINITE);
+        if (g_davStop) break;
+        for (;;) {
+            DavJob job;
+            EnterCriticalSection(&g_davCs);
+            bool has = !g_davQ.empty();
+            if (has) { job = std::move(g_davQ.front()); g_davQ.pop_front(); }
+            LeaveCriticalSection(&g_davCs);
+            if (!has) break;
+            DavJobResult* rs = new DavJobResult();
+            rs->kind = job.kind; rs->bkMode = job.bkMode; rs->sync = job.sync;
+            switch (job.kind) {
+            case DAVJOB_SYNCPOLL: {
+                std::string body; DWORD code = 0;
+                std::wstring err = WebDavRequest(job.cfg, L"GET", DavPath(job.cfg, L"state.json"), nullptr, &body, &code);
+                rs->netOk = err.empty(); rs->err = err; rs->code = code;
+                rs->body = std::move(body);
+                break;
+            }
+            case DAVJOB_SYNCPUSH: {
+                std::wstring err = WebDavUploadState(job.cfg, job.body);
+                rs->netOk = err.empty(); rs->err = err; rs->sig = job.sig;
+                break;
+            }
+            case DAVJOB_BACKUP:
+            case DAVJOB_MANUALBK: {
+                std::wstring err = WebDavUploadBackup(job.cfg, job.body, job.fname);
+                if (err.empty()) RotateBackups(job.cfg);
+                rs->netOk = err.empty(); rs->err = err; rs->sig = job.sig;
+                rs->fname = job.fname; rs->dirName = job.cfg.dir;
+                break;
+            }
+            case DAVJOB_START: {   // 启动: 清理过期备份, 再按模式拉取云端内容
+                RotateBackups(job.cfg);
+                if (job.sync) {
+                    std::string body; DWORD code = 0;
+                    std::wstring err = WebDavRequest(job.cfg, L"GET", DavPath(job.cfg, L"state.json"), nullptr, &body, &code);
+                    rs->netOk = err.empty(); rs->err = err; rs->code = code;
+                    rs->body = std::move(body);
+                } else if (job.bkMode != 0) {
+                    std::vector<std::wstring> files;
+                    if (WebDavListBackups(job.cfg, files).empty() && !files.empty()) {
+                        std::string body;
+                        std::wstring err = WebDavDownload(job.cfg, files.front(), body);   // files 按时间新→旧排序
+                        rs->netOk = err.empty();
+                        rs->body = std::move(body);
+                        rs->files = std::move(files);
+                    }
+                } else {
+                    rs->netOk = true;
+                }
+                break;
+            }
+            }
+            HWND h = g_hwnd;
+            if (h && !g_davStop && PostMessageW(h, WM_APP_DAVJOB, 0, (LPARAM)rs)) continue;
+            delete rs;
+        }
+    }
+    return 0;
+}
+static void StartDavWorker() {
+    if (g_davThread) return;
+    if (!g_davCsInit) { InitializeCriticalSection(&g_davCs); g_davCsInit = true; }
+    g_davEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_davStop = false;
+    g_davThread = (HANDLE)_beginthreadex(nullptr, 0, DavWorkerProc, nullptr, 0, nullptr);
+}
+static void StopDavWorker() {
+    if (!g_davThread) return;
+    g_davStop = true;
+    if (g_davEvt) SetEvent(g_davEvt);
+    // 只在线程确实退出后关闭句柄; 超时说明还在收尾网络请求,
+    // 此刻关闭它正在等待的事件句柄不安全, 交给进程退出回收
+    if (WaitForSingleObject(g_davThread, 2000) == WAIT_OBJECT_0) {
+        CloseHandle(g_davThread); g_davThread = nullptr;
+        if (g_davEvt) { CloseHandle(g_davEvt); g_davEvt = nullptr; }
+    }
+}
+static bool EnqueueDavJob(const DavJob& j) {
+    if (!g_davThread || !g_davEvt) return false;
+    EnterCriticalSection(&g_davCs);
+    g_davQ.push_back(j);
+    LeaveCriticalSection(&g_davCs);
+    SetEvent(g_davEvt);
+    return true;
+}
+// 实时同步推送: 本地有未上传的修改时, 后台线程覆盖云端 state.json
+static void QueueSyncPush() {
+    if (!g_wdSync || Trim(g_webdavUrl).empty() || g_pushPending) return;
     std::string sig = TasksSignature();
     if (sig == g_lastSyncSig) return;   // 无未上传修改
     SaveAppData();
-    std::string body = SerializeTasksJson(g_tasks);   // 同步只含待办数据, 不含本机配置
-    if (!WebDavUploadState(body).empty()) return;     // 失败静默, 下次触发/轮询时重试
-    g_lastSyncSig = sig;
+    DavJob j; j.kind = DAVJOB_SYNCPUSH; j.cfg = SnapDav();
+    j.body = SerializeTasksJson(g_tasks);   // 同步只含待办数据, 不含本机配置
+    j.sig = sig;
+    g_pushPending = EnqueueDavJob(j);
 }
-// 实时同步拉取 (30 秒轮询): 云端有其他机器的修改则应用; 两端都有修改时弹出差异选择
-static void SyncPoll() {
-    if (!g_wdSync || Trim(g_webdavUrl).empty() || !g_hwnd || g_syncDialogOpen) return;
-    std::string body;
-    DWORD code = 0;
-    std::wstring err = WebDavRequest(L"GET", DavPath(L"state.json"), nullptr, &body, &code);
-    if (!err.empty()) return;                        // 网络/服务器错误: 静默, 等下次轮询
-    if (code == 404) { DoSyncPush(); return; }       // 云端还没有主文件: 推送本地
+// 实时同步拉取 (30 秒轮询): 后台 GET, 结果回主线程判断
+static void QueueSyncPoll() {
+    if (!g_wdSync || Trim(g_webdavUrl).empty() || !g_hwnd || g_syncDialogOpen || g_pollPending) return;
+    DavJob j; j.kind = DAVJOB_SYNCPOLL; j.cfg = SnapDav();
+    g_pollPending = EnqueueDavJob(j);
+}
+// 自动备份 (实时/定时共用): 无变化不入队; 失败静默, 下次触发重试
+static void QueueAutoBk() {
+    if (g_wdBkMode == 0 || Trim(g_webdavUrl).empty() || g_bkPending) return;
+    std::string sig = TasksSignature();
+    if (sig == g_lastBackupSig) return;   // 无变化
+    SaveAppData();
+    DavJob j; j.kind = DAVJOB_BACKUP; j.cfg = SnapDav();
+    j.body = SerializeTasksJson(g_tasks);   // 备份只含待办数据, 不含本机配置
+    j.fname = BackupFileName(); j.sig = sig;
+    g_bkPending = EnqueueDavJob(j);
+}
+// 启动时: 清理过期备份 + 按模式拉取云端内容做指纹/差异比对
+static void QueueStartupDav() {
+    if (Trim(g_webdavUrl).empty()) return;
+    DavJob j; j.kind = DAVJOB_START; j.cfg = SnapDav(); j.sync = g_wdSync != 0; j.bkMode = g_wdBkMode;
+    EnqueueDavJob(j);
+}
+// 托盘"备份到 WebDAV": 后台执行, 完成后提示结果
+static void QueueManualBackup() {
+    if (Trim(g_webdavUrl).empty()) {
+        OpenMsgBox(g_hwnd, APP_NAME, L"请先在设置中配置 WebDAV 服务器地址。", false, nullptr);
+        return;
+    }
+    SaveAppData();
+    DavJob j; j.kind = DAVJOB_MANUALBK; j.cfg = SnapDav();
+    j.body = SerializeTasksJson(g_tasks); j.fname = BackupFileName(); j.sig = TasksSignature();
+    EnqueueDavJob(j);
+}
+// 应用云端 state.json 内容 (轮询/启动共用)
+static void ApplySyncBody(const std::string& body, DWORD code, bool startup) {
+    if (code == 404) { QueueSyncPush(); return; }   // 云端还没有主文件: 推送本地
     std::vector<Task> ts;
-    if (!ParseTasksFromJson(body, ts)) return;       // 内容异常: 忽略, 不覆盖本地
+    if (!ParseTasksFromJson(body, ts)) return;      // 内容异常: 忽略, 不覆盖本地
     std::string csig = TasksSignature(ts), lsig = TasksSignature();
     if (csig == lsig) { g_lastSyncSig = csig; g_lastBackupSig = csig; return; }   // 云端与本地一致
-    if (csig == g_lastSyncSig) return;               // 云端就是本地上次推的内容: 本地较新, 等防抖上传
-    if (lsig == g_lastSyncSig) {                     // 本地无未上传修改: 静默应用云端
+    if (!startup && csig == g_lastSyncSig) return;  // 云端就是本地上次推的内容: 本地较新, 等防抖上传
+    if (!startup && lsig == g_lastSyncSig) {        // 本地无未上传修改: 静默应用云端
         g_tasks = ts;
         for (auto& t : g_tasks) t.expanded = false;
         g_lastSyncSig = csig;
@@ -992,59 +1156,53 @@ static void SyncPoll() {
         InvalidateRect(g_hwnd, nullptr, FALSE);
         return;
     }
-    // 两端都有修改: 列出差异, 由用户决定用哪边
+    // 两端都有修改 (或启动时无法判断): 列出差异, 由用户决定用哪边
     OpenBkDiffDialog(g_hwnd, BuildTaskDiff(g_tasks, ts), ts, L"state.json", true);
 }
-// 启动时同步"上次备份指纹": 对比本地任务与云端最新备份, 相同则不视为有变化,
-// 避免程序重启后第一次到期/防抖备份重复上传相同内容
-// 云端备份比本地新 (多台电脑使用场景) 时弹出差异提示, 由用户决定是否恢复, 不自动覆盖
-static void SyncBackupSigOnStart() {
-    if (Trim(g_webdavUrl).empty()) return;
-    if (g_wdSync) {   // 实时同步: 以云端 state.json 为主
-        std::string body;
-        DWORD code = 0;
-        std::wstring err = WebDavRequest(L"GET", DavPath(L"state.json"), nullptr, &body, &code);
-        if (!err.empty()) return;                    // 网络问题: 先用本地启动, 之后轮询自动同步
-        if (code == 404) { DoSyncPush(); return; }   // 云端还没有主文件: 推送本地
-        std::vector<Task> ts;
-        if (!ParseTasksFromJson(body, ts)) return;
-        std::string csig = TasksSignature(ts), lsig = TasksSignature();
-        if (csig == lsig) { g_lastSyncSig = csig; return; }   // 内容一致: 无需动作
-        // 内容不同: 启动时无法确定哪边更新, 列出差异由用户选择
-        OpenBkDiffDialog(g_hwnd, BuildTaskDiff(g_tasks, ts), ts, L"state.json", true);
-        return;
-    }
-    if (g_wdBkMode == 0) return;   // 仅备份模式启用时才比对云端备份
-    std::vector<std::wstring> files;
-    if (!WebDavListBackups(files).empty() || files.empty()) return;
-    std::string body;
-    DWORD code = 0;
-    if (!WebDavDownload(files.front(), body).empty()) return;   // files 按时间新→旧排序
+// 启动时备份模式: 云端最新备份比本地新则列出差异, 由用户决定是否恢复
+static void ApplyStartupBackup(DavJobResult* rs) {
     std::vector<Task> ts;
-    if (!ParseTasksFromJson(body, ts)) return;
+    if (!ParseTasksFromJson(rs->body, ts)) return;
     std::string csig = TasksSignature(ts), lsig = TasksSignature(g_tasks);
     if (csig == lsig) { g_lastBackupSig = lsig; return; }   // 内容一致: 无需备份
-    // 内容不同: 用云端备份文件名中的时间与本地配置文件最后写入时间判断新旧
     FILETIME ftCloud = {}, ftLocal = {};
-    bool haveCloud = BackupFileDateTime(files.front(), ftCloud);
+    bool haveCloud = BackupFileDateTime(rs->files.front(), ftCloud);
     WIN32_FILE_ATTRIBUTE_DATA fa;
     bool haveLocal = GetFileAttributesExW(g_cfgPath.c_str(), GetFileExInfoStandard, &fa) != 0
                      && FileTimeToLocalFileTime(&fa.ftLastWriteTime, &ftLocal) != 0;
-    if (haveCloud && haveLocal && *(long long*)&ftCloud > *(long long*)&ftLocal) {
-        // 云端较新: 列出差异, 由用户选择 (取消/保留本地 -> 之后自动备份会把本地上传覆盖云端)
-        OpenBkDiffDialog(g_hwnd, BuildTaskDiff(g_tasks, ts), ts, files.front());
-    }
-    // 云端较旧或时间无法判断: 保持本地 (原行为)
+    if (haveCloud && haveLocal && *(long long*)&ftCloud > *(long long*)&ftLocal)
+        OpenBkDiffDialog(g_hwnd, BuildTaskDiff(g_tasks, ts), ts, rs->files.front());
+    // 云端较旧或时间无法判断: 保持本地
 }
-// 执行一次自动备份 (静默: 失败不提示, 等下次触发重试)
-static void DoAutoBk() {
-    if (g_wdBkMode == 0 || Trim(g_webdavUrl).empty()) return;
-    if (TasksSignature() == g_lastBackupSig) return;   // 无变化
-    SaveAppData();
-    std::string body = SerializeTasksJson(g_tasks);   // 备份只含待办数据, 不含本机配置
-    if (!WebDavUploadBackup(body, BackupFileName()).empty()) return;
-    g_lastBackupSig = TasksSignature();
-    RotateBackups();
+// 后台任务结果 (UI 线程): 只在此处修改任务数据/指纹/弹窗
+static void HandleDavJobResult(DavJobResult* rs) {
+    switch (rs->kind) {
+    case DAVJOB_SYNCPUSH:
+        g_pushPending = false;
+        if (rs->netOk) g_lastSyncSig = rs->sig;
+        break;
+    case DAVJOB_BACKUP:
+        g_bkPending = false;
+        if (rs->netOk) g_lastBackupSig = rs->sig;
+        break;
+    case DAVJOB_MANUALBK:
+        if (rs->netOk) {
+            g_lastBackupSig = rs->sig;
+            OpenMsgBox(g_hwnd, APP_NAME, L"已备份为 " + rs->dirName + L"/" + rs->fname, false, nullptr);
+        } else {
+            OpenMsgBox(g_hwnd, APP_NAME, L"备份失败: " + rs->err, false, nullptr);
+        }
+        break;
+    case DAVJOB_SYNCPOLL:
+        g_pollPending = false;
+        if (rs->netOk) ApplySyncBody(rs->body, rs->code, false);   // 网络错误: 静默, 等下次轮询
+        break;
+    case DAVJOB_START:
+        if (!rs->netOk) break;   // 网络问题: 用本地启动, 之后轮询/定时自动同步
+        if (rs->sync) ApplySyncBody(rs->body, rs->code, true);
+        else if (rs->bkMode != 0 && !rs->files.empty()) ApplyStartupBackup(rs);
+        break;
+    }
 }
 // 实时备份/同步: 任务变化后 10 秒防抖, 合并连续修改为一次上传
 static void ScheduleAutoBk() {
@@ -1720,7 +1878,7 @@ static void DavPreviewBackup(DlgCtx* c, int sel) {
     if (c->prevName != name) {
         std::string body;
         DWORD code = 0;
-        std::wstring err = WebDavDownload(name, body);
+        std::wstring err = WebDavDownload(SnapDav(), name, body);
         if (!err.empty() || code >= 400) {
             SetWindowTextW(c->e1, (L"下载失败: " + err).c_str());
             c->previewOk = false; c->prevName = name;
@@ -1744,7 +1902,7 @@ static void OpenDavRestoreDialog(HWND owner) {
         return;
     }
     g_davBackups.clear();
-    std::wstring err = WebDavListBackups(g_davBackups);
+    std::wstring err = WebDavListBackups(SnapDav(), g_davBackups);
     if (!err.empty()) {
         OpenMsgBox(owner, APP_NAME, L"获取备份列表失败:\n" + err, false, nullptr);
         return;
@@ -2230,7 +2388,7 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             if (c->mode == DLG_BKDIFF && c->isSync) {
                 g_lastSyncSig.clear();
                 DestroyWindow(h);
-                DoSyncPush();
+                QueueSyncPush();   // 后台推送, 不阻塞界面
             } else {
                 DestroyWindow(h);
             }
@@ -2290,7 +2448,8 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 if (!ok) return;
                 SetCursor(LoadCursor(nullptr, IDC_WAIT));
                 DWORD code = 0;
-                std::wstring err = WebDavRequest(L"DELETE", DavPath(g_davBackups[delSel]), nullptr, nullptr, &code);
+                DavConf cfg = SnapDav();
+                std::wstring err = WebDavRequest(cfg, L"DELETE", DavPath(cfg, g_davBackups[delSel]), nullptr, nullptr, &code);
                 SetCursor(LoadCursor(nullptr, IDC_ARROW));
                 if (!err.empty() && code != 404) {
                     OpenMsgBox(c->h, APP_NAME, L"删除失败: " + err, false, nullptr);
@@ -2805,20 +2964,7 @@ static void ShowTrayMenu() {
         else { ShowWindow(g_hwnd, SW_SHOW); SetForegroundWindow(g_hwnd); }
         break;
     case 2: SetAutoStart(!GetAutoStart()); break;
-    case 3: {
-        SaveAppData();
-        std::string body = SerializeTasksJson(g_tasks);   // 备份只含待办数据
-        std::wstring name = BackupFileName();
-        std::wstring err = WebDavUploadBackup(body, name);
-        if (err.empty()) {
-            g_lastBackupSig = TasksSignature();   // 记录指纹, 退出时无变化则不再备份
-            RotateBackups();
-            OpenMsgBox(g_hwnd, APP_NAME, L"已备份为 " + g_webdavDir + L"/" + name, false, nullptr);
-        } else {
-            OpenMsgBox(g_hwnd, APP_NAME, L"备份失败: " + err, false, nullptr);
-        }
-        break;
-    }
+    case 3: QueueManualBackup(); break;   // 后台备份, 完成后弹提示
     case 5: OpenSettingsDialog(); break;
     case 6: OpenDavRestoreDialog(g_hwnd); break;
     case 9: DestroyWindow(g_hwnd); break;
@@ -2906,13 +3052,17 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         RebuildRows();
         UpdateAutoBkTimer();   // 定时备份: 按配置启动周期定时器
         SetTimer(h, TIMER_DPICHECK, 1000, nullptr);   // DPI/拓扑自检兜底 (每秒)
-        // 启动时: 先同步"上次备份指纹" (本地与云端最新备份相同则不重复上传), 再清理过期备份
-        SyncBackupSigOnStart();
-        if (!Trim(g_webdavUrl).empty()) RotateBackups();
+        // 启动时: 后台线程清理过期备份并比对云端内容 (网络 I/O 不阻塞界面)
+        StartDavWorker();
+        QueueStartupDav();
         return 0;
     }
     case WM_APP_DLG:
         HandleDlgResult((DlgResult*)lp);
+        return 0;
+    case WM_APP_DAVJOB:   // 后台 WebDAV 任务结果
+        HandleDavJobResult((DavJobResult*)lp);
+        delete (DavJobResult*)lp;
         return 0;
     case WM_APP_UPDCHECK: {   // 更新检查结果 (后台线程投递)
         UpdResult* rs = (UpdResult*)lp;
@@ -3211,11 +3361,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         // 实时备份: 10 秒防抖到期; 定时备份: 周期到期 (内部都做指纹比较, 无变化不上传)
         if (wp == TIMER_AUTOBK_DEBOUNCE) {
             KillTimer(h, TIMER_AUTOBK_DEBOUNCE);
-            DoAutoBk();        // 实时备份 (模式 1)
-            DoSyncPush();      // 实时同步推送 (开关开启时)
+            QueueAutoBk();     // 实时备份 (后台线程)
+            QueueSyncPush();   // 实时同步推送 (后台线程)
         }
-        else if (wp == TIMER_AUTOBK_TICK) DoAutoBk();
-        else if (wp == TIMER_SYNC_POLL) SyncPoll();   // 实时同步: 拉取其他机器的修改
+        else if (wp == TIMER_AUTOBK_TICK) QueueAutoBk();
+        else if (wp == TIMER_SYNC_POLL) QueueSyncPoll();   // 实时同步: 后台拉取其他机器的修改
         else if (wp == TIMER_DPICHECK) {   // 显示模式切换可能不触发任何消息, 定时兜底校验
             if (!g_inMove && !IsIconic(h) && IsWindowVisible(h)) {
                 // 调试日志: 仅在观测值变化时记录, 供跨屏适配问题排查
@@ -3250,6 +3400,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         KillTimer(h, TIMER_AUTOBK_TICK);
         KillTimer(h, TIMER_DPICHECK);
         KillTimer(h, TIMER_SYNC_POLL);
+        StopDavWorker();   // 结束后台网络线程
         UnregisterHotKey(h, 1);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         PostQuitMessage(0);
