@@ -1,6 +1,16 @@
 miniTodo极简待办任务清单
 
 2026-11-12：
+2.1.2 - 增加安卓版本。
+
+<img width="451" height="772" alt="image" src="https://github.com/user-attachments/assets/3318ae04-52cf-4891-9a30-aba0d27e8d4f" />
+<img width="451" height="772" alt="image" src="https://github.com/user-attachments/assets/1b08c3bb-3783-4eff-a9e0-35dc3d32f973" />
+<img width="451" height="772" alt="image" src="https://github.com/user-attachments/assets/0f65b817-4368-4517-a520-585575f8abe4" />
+<img width="451" height="772" alt="image" src="https://github.com/user-attachments/assets/39abc566-ff0a-4121-b630-4641d0bb8339" />
+<img width="451" height="772" alt="image" src="https://github.com/user-attachments/assets/80816ae0-f830-4c4c-ba27-ca72da6646db" />
+
+
+2026-11-12：
 2.1.2 - 优化关于页面显示的WebDAV配置信息方式。
 
 2026-11-12：
