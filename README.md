@@ -1,6 +1,7 @@
 miniTodo极简待办任务清单
 
 2026-11-13：
+2.1.4 - 优化了自绘浮窗的显示方式。
 2.1.3 - 优化了托盘栏图标鼠标悬停时弹窗显示方式，避免系统自带API截断待办信息内容，通过自绘窗口显示所有待办清单。
 <img width="300" height="171" alt="image" src="https://github.com/user-attachments/assets/e966eadd-c5a8-43ab-a2a5-8fd62ae61253" />
 
