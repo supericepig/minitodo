@@ -32,7 +32,7 @@
 
 // ---------------- 常量 ----------------
 #define APP_NAME     L"MiniTodo"
-#define APP_VER      L"2.1.1"    // 每次功能修改后递增 (功能+0.1 / 修复+0.0.1)
+#define APP_VER      L"2.1.3"    // 每次功能修改后递增 (功能+0.1 / 修复+0.0.1)
 #define WM_APP_TRAY  (WM_APP + 1)   // 托盘回调
 #define WM_APP_DLG   (WM_APP + 2)   // 对话框结果 (lParam = new DlgResult)
 #define WM_APP_UPDCHECK (WM_APP + 3)   // 更新检查结果 (lParam = new UpdResult)
@@ -116,6 +116,8 @@ static void StartUpdateCheck(bool manual);   // 前置声明 (定义在自绘消
 #define TIMER_AUTOBK_TICK     3   // 定时备份 (可配置小时数, 周期)
 #define TIMER_DPICHECK        4   // DPI/拓扑自检 (1 秒兜底, 部分显示模式切换不触发任何消息)
 #define TIMER_SYNC_POLL       5   // 实时同步拉取轮询 (30 秒)
+#define TIMER_TRAY_SHOW       6   // 托盘悬停浮窗延迟弹出 (单次)
+#define TIMER_TRAY_POLL       7   // 托盘悬停浮窗鼠标离开检测 (周期)
 static COLORREF g_bg = RGB(250, 250, 250);     // 窗口背景色
 static HBRUSH   g_bgBrush = nullptr;           // 背景色画刷 (随 g_bg 重建)
 static UINT g_hkMods = MOD_CONTROL | MOD_ALT;  // 显示/隐藏快捷键
@@ -1284,21 +1286,186 @@ static HICON MakeIcon(int size) {
     return ic;
 }
 
-// ---------------- 托盘提示 (悬停显示待完成列表) ----------------
-static void UpdateTrayTip() {
+static int WrapText(HDC dc, const std::wstring& text, int availW, std::wstring* out);   // 前置声明 (定义在视图区)
+// ---------------- 托盘悬停浮窗 (自绘, 显示完整未完成列表) ----------------
+// 系统托盘 szTip 上限 128 字符, 无法显示完整清单, 故悬停时弹自绘浮窗替代系统提示
+static HWND  g_pop = nullptr;          // 浮窗句柄 (懒创建, 复用)
+static int   g_popScroll = 0;          // 当前滚动像素
+static int   g_popContentH = 0;        // 内容总高
+static int   g_popViewH = 0;           // 可视高
+static RECT  g_popIcon = {};           // 托盘图标屏幕矩形 (鼠标离开判定用)
+static int   g_popOutTicks = 0;        // 连续在外的检测次数 (防止经过图标间隙误关)
+
+// 取托盘图标屏幕矩形 (Win7+; 失败时返回 false)
+static bool TrayIconRect(RECT* out) {
+    NOTIFYICONIDENTIFIER id = {};
+    id.cbSize = sizeof(id);
+    id.hWnd = g_hwnd;
+    id.uID = 1;
+    return SUCCEEDED(Shell_NotifyIconGetRect(&id, out));
+}
+// 单条待办显示文本 (不含项目符号, 符号单独绘制以避免独占一行)
+static std::wstring PopText(const Task& t) {
+    std::wstring s = t.text;
+    if (!t.due.empty()) s += L" (" + t.due + L")";
+    return s;
+}
+// 按客户区宽度测量浮窗内容总高
+static void PopMeasure(HDC dc, int w, int* contentH) {
+    HFONT of = (HFONT)SelectObject(dc, fUI);
+    RECT r1 = { 0, 0, 0, 0 };
+    DrawTextW(dc, L"Mg", -1, &r1, DT_SINGLELINE | DT_CALCRECT);
+    int lineH = r1.bottom, pad = SC(10), availW = w - pad * 2 - SC(12);
+    int y = pad + lineH + SC(6);   // 标题行
     int n = 0;
-    std::wstring list;
     for (auto& t : g_tasks) {
         if (t.done) continue;
         ++n;
-        if (list.size() < 90) {
-            list += L"\n· " + t.text;
-            if (!t.due.empty()) list += L" (" + t.due + L")";
-        }
+        int lines = WrapText(dc, PopText(t), availW, nullptr);
+        y += (lines < 1 ? 1 : lines) * lineH + SC(4);
     }
-    std::wstring tip = APP_NAME L" 待完成 " + std::to_wstring(n) + L" 项" + list;
-    if (tip.size() > 120) tip.resize(120);
-    lstrcpynW(g_nid.szTip, tip.c_str(), 128);
+    if (n == 0) y += lineH;
+    SelectObject(dc, of);
+    *contentH = y + pad;
+}
+static LRESULT CALLBACK PopProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+    case WM_MOUSEACTIVATE:   // 浮窗不抢焦点
+        return MA_NOACTIVATE;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        FillRect(dc, &rc, g_bgBrush ? g_bgBrush : (HBRUSH)GetStockObject(WHITE_BRUSH));
+        FrameRect(dc, &rc, CachedBrush(RGB(180, 180, 180)));   // 1px 边框
+        SetBkMode(dc, TRANSPARENT);
+        HFONT of = (HFONT)SelectObject(dc, fUI);
+        RECT r1 = { 0, 0, 0, 0 };
+        DrawTextW(dc, L"Mg", -1, &r1, DT_SINGLELINE | DT_CALCRECT);
+        int lineH = r1.bottom, pad = SC(10), bulletW = SC(12);
+        int w = rc.right - rc.left;
+        int textX = pad + bulletW, availW = w - textX - pad;
+        int n = 0;
+        for (auto& t : g_tasks) if (!t.done) ++n;
+        // 标题 (固定, 不随滚动)
+        SetTextColor(dc, RGB(30, 30, 30));
+        std::wstring title = L"待完成 " + std::to_wstring(n) + L" 项";
+        RECT tr = { pad, pad, w - pad, pad + lineH };
+        DrawTextW(dc, title.c_str(), -1, &tr, DT_SINGLELINE | DT_NOPREFIX);
+        // 条目 (可滚动)
+        int y = pad + lineH + SC(6) - g_popScroll;
+        if (n == 0) {
+            SetTextColor(dc, RGB(120, 120, 120));
+            RECT er = { pad, y, w - pad, y + lineH };
+            DrawTextW(dc, L"暂无未完成事项", -1, &er, DT_SINGLELINE | DT_NOPREFIX);
+        } else {
+            SetTextColor(dc, RGB(25, 25, 25));
+            for (auto& t : g_tasks) {
+                if (t.done) continue;
+                std::wstring s = PopText(t), wrapped;
+                int lines = WrapText(dc, s, availW, &wrapped);
+                if (lines < 1) lines = 1;
+                int ih = lines * lineH;
+                if (y + ih > pad && y < rc.bottom - pad) {   // 仅绘制可见条目
+                    RECT br = { pad, y, pad + bulletW, y + lineH };
+                    DrawTextW(dc, L"·", -1, &br, DT_SINGLELINE | DT_NOPREFIX);   // 项目符号独立列
+                    // 逐行绘制 (悬挂缩进: 续行与首行左对齐于文本列)
+                    const std::wstring& src = wrapped.empty() ? s : wrapped;
+                    int li = 0;
+                    size_t st = 0;
+                    while (st <= src.size()) {
+                        size_t p = src.find(L'\n', st);
+                        std::wstring line = (p == std::wstring::npos) ? src.substr(st) : src.substr(st, p - st);
+                        RECT ir = { textX, y + li * lineH, w - pad, y + (li + 1) * lineH };
+                        DrawTextW(dc, line.c_str(), -1, &ir, DT_SINGLELINE | DT_NOPREFIX | DT_VCENTER);
+                        if (p == std::wstring::npos) break;
+                        st = p + 1; ++li;
+                    }
+                }
+                y += ih + SC(4);
+            }
+        }
+        // 内容超出时右侧画细滚动条
+        if (g_popContentH > g_popViewH && g_popViewH > 0) {
+            int trackH = rc.bottom - rc.top - SC(8);
+            int thumbH = std::max(SC(20), trackH * g_popViewH / g_popContentH);
+            int maxScroll = g_popContentH - g_popViewH;
+            int thumbY = SC(4) + (maxScroll > 0 ? (trackH - thumbH) * g_popScroll / maxScroll : 0);
+            RECT tb = { rc.right - SC(5), thumbY, rc.right - SC(2), thumbY + thumbH };
+            FillRect(dc, &tb, CachedBrush(RGB(190, 190, 190)));
+        }
+        SelectObject(dc, of);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        int maxScroll = std::max(0, g_popContentH - g_popViewH);
+        if (maxScroll <= 0) return 0;
+        g_popScroll -= GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * SC(28);
+        if (g_popScroll < 0) g_popScroll = 0;
+        if (g_popScroll > maxScroll) g_popScroll = maxScroll;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+        return 0;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+static void EnsurePopClass() {
+    static bool done = false;
+    if (done) return;
+    WNDCLASSEXW wc = { sizeof(wc) };
+    wc.lpfnWndProc = PopProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"MTPop";
+    RegisterClassExW(&wc);
+    done = true;
+}
+static void HideTrayPopup() {
+    if (g_hwnd) KillTimer(g_hwnd, TIMER_TRAY_POLL);
+    if (g_pop) ShowWindow(g_pop, SW_HIDE);
+    g_popOutTicks = 0;
+}
+static void ShowTrayPopup() {
+    if (!g_hwnd || !g_bgBrush) return;
+    EnsurePopClass();
+    if (!g_pop) {
+        g_pop = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"MTPop", L"",
+                                WS_POPUP, 0, 0, SC(300), SC(100), g_hwnd, nullptr,
+                                GetModuleHandleW(nullptr), nullptr);
+        if (!g_pop) return;
+    }
+    int w = SC(300), contentH = 0;
+    HDC dc = GetDC(g_pop);
+    if (dc) { PopMeasure(dc, w, &contentH); ReleaseDC(g_pop, dc); }
+    RECT ir;
+    if (!TrayIconRect(&ir)) {   // 取不到图标位置时以鼠标为锚点
+        POINT pt; GetCursorPos(&pt);
+        ir.left = pt.x; ir.right = pt.x + 1; ir.top = pt.y; ir.bottom = pt.y + 1;
+    }
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfoW(MonitorFromRect(&ir, MONITOR_DEFAULTTONEAREST), &mi);
+    int maxH = std::min(SC(420), (int)((mi.rcWork.bottom - mi.rcWork.top) * 6 / 10));
+    int h = std::min(contentH, maxH);
+    g_popContentH = contentH; g_popViewH = h; g_popScroll = 0;
+    int x = ir.left + ((ir.right - ir.left) - w) / 2;
+    int y = ir.top - h - SC(8);   // 优先显示在图标上方 (任务栏通常在下)
+    if (y < mi.rcWork.top) y = ir.bottom + SC(8);
+    x = std::max((int)mi.rcWork.left + SC(4), std::min(x, (int)mi.rcWork.right - w - SC(4)));
+    y = std::max((int)mi.rcWork.top + SC(4), std::min(y, (int)mi.rcWork.bottom - h - SC(4)));
+    g_popIcon = ir;
+    g_popOutTicks = 0;
+    SetWindowPos(g_pop, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_pop, nullptr, FALSE);
+    SetTimer(g_hwnd, TIMER_TRAY_POLL, 200, nullptr);
+}
+// 托盘图标自带气泡提示已由浮窗替代 (szTip 留空, 避免与浮窗同时出现)
+static void UpdateTrayTip() {
+    g_nid.szTip[0] = 0;
     if (g_hwnd) Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
@@ -1720,6 +1887,7 @@ struct DlgCtx {
     HWND chkAuto = nullptr;                                // 设置: 开机自启
     HWND chkUpd = nullptr;                                 // 设置: 启动检查更新
     HWND updBtn = nullptr, updStatus = nullptr, updLink = nullptr;   // 关于: 检查更新按钮 / 状态文本 / GitHub 链接
+    HWND restBtn = nullptr;                                // WebDAV: 恢复备份按钮 (按钮文字显示当前文件夹)
     UINT pMods = 0, pVk = 0;                               // 捕获到的快捷键
     int selBg = -1;                                        // 选中的背景色
     RECT sw[BGCOUNT];                                      // 色块矩形
@@ -2124,7 +2292,8 @@ static void DlgOnCreate(DlgCtx* c) {
         RefreshSubList(c);
         SetFocus(c->e1);
     } else if (c->mode == DLG_DAVREST) {
-        label(L"选择备份 (点击条目自动预览内容):", SC(10), DLG_TOP + SC(8), w - SC(20));
+        label((L"备份文件夹 /" + g_webdavDir + L"/ — 选择备份 (点击条目自动预览内容):").c_str(),
+              SC(10), DLG_TOP + SC(8), w - SC(20));
         c->list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", nullptr,
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWVARIABLE | LBS_HASSTRINGS,
                                   SC(10), DLG_TOP + SC(26), w - SC(20), SC(110), c->h, (HMENU)(INT_PTR)IDC_LIST, hi, nullptr);
@@ -2189,8 +2358,16 @@ static void DlgOnCreate(DlgCtx* c) {
         if (g_updChecking) { SetWindowTextW(c->updBtn, L"检查更新中…"); EnableWindow(c->updBtn, FALSE); }
         c->pg2.push_back(label(L"纯 Win32 API 单文件程序, 无外部依赖", SC(10), cy + SC(168), w - SC(20)));
         c->pg2.push_back(label(L"数据保存在程序目录 todo.json (含 .bak 滚动备份)", SC(10), cy + SC(192), w - SC(20)));
-        c->pg2.push_back(label(L"WebDAV 备份: /miniTodo/todo-日期-时间.json", SC(10), cy + SC(216), w - SC(20)));
-        c->pg2.push_back(label(L"实时同步主文件: /miniTodo/state.json", SC(10), cy + SC(240), w - SC(20)));
+        // WebDAV 路径随设置动态显示 (未配置时明确提示)
+        if (Trim(g_webdavUrl).empty()) {
+            c->pg2.push_back(label(L"WebDAV 备份: 未配置", SC(10), cy + SC(216), w - SC(20)));
+            c->pg2.push_back(label(L"实时同步主文件: 未配置", SC(10), cy + SC(240), w - SC(20)));
+        } else {
+            c->pg2.push_back(label((L"WebDAV 备份: /" + g_webdavDir + L"/todo-日期-时间.json").c_str(),
+                                   SC(10), cy + SC(216), w - SC(20)));
+            c->pg2.push_back(label((L"实时同步主文件: /" + g_webdavDir + L"/state.json").c_str(),
+                                   SC(10), cy + SC(240), w - SC(20)));
+        }
         // ---- 页 1: WebDAV ----
         c->pg1.push_back(label(L"WebDAV 地址 (目录, 如 https://dav.example.com/dav/):", SC(10), cy + SC(10), w - SC(20)));
         c->e1 = edit(IDC_E1, SC(10), cy + SC(28), w - SC(20));
@@ -2234,7 +2411,8 @@ static void DlgOnCreate(DlgCtx* c) {
                                      SC(140), cy + SC(271), SC(36), SC(22), c->h, (HMENU)(INT_PTR)IDC_HOURS, hi, nullptr);
         c->pg1.push_back(c->bkRb0); c->pg1.push_back(c->bkRb1); c->pg1.push_back(c->bkRb2); c->pg1.push_back(c->hoursEd);
         c->pg1.push_back(label(L"小时", SC(184), cy + SC(275), SC(60)));
-        HWND restBtn = btn(L"浏览备份并恢复…", IDC_REST, SC(10), h - SC(36), SC(130));
+        HWND restBtn = btn((L"恢复备份 (/" + c->pend4 + L")…").c_str(), IDC_REST, SC(10), h - SC(36), SC(150));
+        c->restBtn = restBtn;
         c->pg1.push_back(restBtn);
         SendMessage(c->bkRb0, BM_SETCHECK, c->pendBkMode == 0 ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessage(c->bkRb1, BM_SETCHECK, c->pendBkMode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -2412,6 +2590,17 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
         if (c->mode == DLG_SETTINGS && id == IDC_REST) {
             OpenDavRestoreDialog(h);   // 属主为设置窗口, 关闭后自动恢复其可用状态
+            return 0;
+        }
+        if (c->mode == DLG_SETTINGS && id == IDC_FOLDER && HIWORD(wp) == EN_CHANGE) {
+            // 备份文件夹改动时实时更新恢复按钮文字 (与保存时的清洗规则一致)
+            wchar_t buf[128] = {};
+            GetWindowTextW(c->e4, buf, 128);
+            std::wstring d = Trim(buf);
+            d.erase(std::remove_if(d.begin(), d.end(),
+                    [](wchar_t ch) { return ch == L'/' || ch == L'\\'; }), d.end());
+            if (d.empty()) d = L"miniTodo";
+            if (c->restBtn) SetWindowTextW(c->restBtn, (L"恢复备份 (/" + d + L")…").c_str());
             return 0;
         }
         if (c->mode == DLG_SETTINGS && id == IDC_GH && HIWORD(wp) == STN_CLICKED) {
@@ -3029,7 +3218,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         g_nid.uCallbackMessage = WM_APP_TRAY;
         g_nid.hIcon = g_icon;
-        lstrcpynW(g_nid.szTip, APP_NAME L" - 待办清单", ARRAYSIZE(g_nid.szTip));
+        lstrcpynW(g_nid.szTip, L"", ARRAYSIZE(g_nid.szTip));   // 悬停清单改由自绘浮窗显示 (系统提示 128 字符上限)
         Shell_NotifyIconW(NIM_ADD, &g_nid);
         // 恢复配置 (窗口位置等), 之后按配置注册快捷键
         LoadAppData();
@@ -3349,9 +3538,13 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_APP_TRAY:
         if (lp == WM_LBUTTONUP) {
+            HideTrayPopup();
             ToggleVisible();
         } else if (lp == WM_RBUTTONUP) {
+            HideTrayPopup();
             ShowTrayMenu();
+        } else if (lp == WM_MOUSEMOVE) {   // 悬停: 延迟 350ms 弹出自绘浮窗 (避免鼠标经过时闪出)
+            if (!g_pop || !IsWindowVisible(g_pop)) SetTimer(h, TIMER_TRAY_SHOW, 350, nullptr);
         }
         return 0;
     case WM_HOTKEY:
@@ -3366,6 +3559,19 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
         else if (wp == TIMER_AUTOBK_TICK) QueueAutoBk();
         else if (wp == TIMER_SYNC_POLL) QueueSyncPoll();   // 实时同步: 后台拉取其他机器的修改
+        else if (wp == TIMER_TRAY_SHOW) {   // 悬停延迟到期: 弹出待办浮窗
+            KillTimer(h, TIMER_TRAY_SHOW);
+            ShowTrayPopup();
+        }
+        else if (wp == TIMER_TRAY_POLL) {   // 检测鼠标是否离开图标/浮窗
+            POINT pt; GetCursorPos(&pt);
+            RECT wr = {};
+            bool inPop = g_pop && IsWindowVisible(g_pop) && GetWindowRect(g_pop, &wr) && PtInRect(&wr, pt);
+            RECT ir = {};
+            bool inIcon = TrayIconRect(&ir) && PtInRect(&ir, pt);
+            if (inPop || inIcon) g_popOutTicks = 0;
+            else if (++g_popOutTicks >= 2) HideTrayPopup();   // 连续两次在外才关, 容忍图标与浮窗的间隙
+        }
         else if (wp == TIMER_DPICHECK) {   // 显示模式切换可能不触发任何消息, 定时兜底校验
             if (!g_inMove && !IsIconic(h) && IsWindowVisible(h)) {
                 // 调试日志: 仅在观测值变化时记录, 供跨屏适配问题排查
@@ -3400,6 +3606,9 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         KillTimer(h, TIMER_AUTOBK_TICK);
         KillTimer(h, TIMER_DPICHECK);
         KillTimer(h, TIMER_SYNC_POLL);
+        KillTimer(h, TIMER_TRAY_SHOW);
+        KillTimer(h, TIMER_TRAY_POLL);
+        if (g_pop) { DestroyWindow(g_pop); g_pop = nullptr; }
         StopDavWorker();   // 结束后台网络线程
         UnregisterHotKey(h, 1);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
