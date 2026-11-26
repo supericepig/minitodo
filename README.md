@@ -1,4 +1,9 @@
 miniTodo极简待办任务清单
+2026-11-26：</br>
+2.1.5 - 增加鼠标悬停托盘栏图标时自绘浮窗的显示开关。</br>
+
+<img width="228" height="187" alt="image" src="https://github.com/user-attachments/assets/c5287dea-01cf-4d26-b33e-3ff2a8ac177b" /></br>
+<img width="420" height="408" alt="image" src="https://github.com/user-attachments/assets/ab575972-2ec7-40a7-8377-602c6e7cfcae" /></br>
 
 2026-11-13：</br>
 2.1.4 - 优化了自绘浮窗的显示方式。</br>
