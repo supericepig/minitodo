@@ -32,7 +32,7 @@
 
 // ---------------- 常量 ----------------
 #define APP_NAME     L"MiniTodo"
-#define APP_VER      L"2.1.3"    // 每次功能修改后递增 (功能+0.1 / 修复+0.0.1)
+#define APP_VER      L"2.1.4"    // 每次功能修改后递增 (功能+0.1 / 修复+0.0.1)
 #define WM_APP_TRAY  (WM_APP + 1)   // 托盘回调
 #define WM_APP_DLG   (WM_APP + 2)   // 对话框结果 (lParam = new DlgResult)
 #define WM_APP_UPDCHECK (WM_APP + 3)   // 更新检查结果 (lParam = new UpdResult)
@@ -73,7 +73,7 @@ enum { B_ADD = 1, B_TAB0, B_TAB1, B_PIN, B_OPM, B_OPTXT, B_OPP, B_CLOSE, B_SET, 
 // 对话框模式
 enum { DLG_ADDTASK = 1, DLG_EDITTASK, DLG_SUBTASK, DLG_SETTINGS, DLG_DAVREST, DLG_COLORPOP, DLG_BKDIFF, DLG_CONFIRM };
 // 对话框内部控件 ID
-enum { IDC_E1 = 200, IDC_E2, IDC_E3, IDC_LIST, IDC_ADDSUB, IDC_EDITSUB, IDC_DELSUB, IDC_CHKAUTO, IDC_HK, IDC_AUTO, IDC_FOLDER, IDC_KEEP, IDC_REST, IDC_DELB, IDC_BKMODE0, IDC_BKMODE1, IDC_BKMODE2, IDC_HOURS, IDC_SYNC, IDC_CHKUPD, IDC_GH, IDC_CHKUPDCFG };
+enum { IDC_E1 = 200, IDC_E2, IDC_E3, IDC_LIST, IDC_ADDSUB, IDC_EDITSUB, IDC_DELSUB, IDC_CHKAUTO, IDC_HK, IDC_AUTO, IDC_FOLDER, IDC_KEEP, IDC_REST, IDC_DELB, IDC_BKMODE0, IDC_BKMODE1, IDC_BKMODE2, IDC_HOURS, IDC_SYNC, IDC_CHKUPD, IDC_GH, IDC_CHKUPDCFG, IDC_TRAYHOVER, IDC_TRAYDELAY };
 #define BGCOUNT 9
 static int DLG_TOP = 30;   // 弹窗自绘标题栏高度 (96dpi 基准, WinMain 中缩放)
 
@@ -101,6 +101,8 @@ static int g_wdBkMode = 0;                       // 自动备份模式: 0=关 1=
 static int g_wdSync = 0;                         // 实时同步开关 (与备份相互独立): 1=多台电脑间保持一致
 static int g_wdBkHours = 4;                      // 定时备份间隔 (小时)
 static bool g_showStart = true;                  // 启动时显示主窗口
+static bool g_trayHover = true;                  // 悬停托盘图标时显示任务清单浮窗
+static int  g_trayHoverDelay = 350;              // 悬停浮窗弹出延时 (毫秒)
 // 自动更新检查 (GitHub Releases)
 static const wchar_t* kRepoUrl   = L"https://github.com/supericepig/minitodo";
 static const wchar_t* kRepoApi   = L"https://api.github.com/repos/supericepig/minitodo/releases/latest";
@@ -492,13 +494,14 @@ static std::string SerializeApp() {
         rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, (int)g_alpha, g_topmost ? "true" : "false");
     o += ui;
     JsonEsc(g_hkStr, o);
-    char extra[192], bg[64];
+    char extra[192], bg[96];
     sprintf(extra, ",\"lw\":%lld,\"lh\":%lld,\"dpi\":%lld,\"wax\":%lld,\"way\":%lld,\"waw\":%lld,\"wah\":%lld",
             lw, lh, sdpi, wax, way, waw, wah);   // 跨屏/跨 DPI 还原用 (v1.9+)
     o += extra;
-    sprintf(bg, ",\"bg\":\"%02X%02X%02X\",\"showstart\":%s,\"checkupdate\":%s}",
+    sprintf(bg, ",\"bg\":\"%02X%02X%02X\",\"showstart\":%s,\"checkupdate\":%s,\"trayhover\":%s,\"traydelay\":%d}",
             GetRValue(g_bg), GetGValue(g_bg), GetBValue(g_bg),
-            g_showStart ? "true" : "false", g_checkUpdate ? "true" : "false");
+            g_showStart ? "true" : "false", g_checkUpdate ? "true" : "false",
+            g_trayHover ? "true" : "false", g_trayHoverDelay);
     o += bg;
     o += ",\"webdav\":{\"url\":";  JsonEsc(g_webdavUrl, o);
     o += ",\"user\":";             JsonEsc(g_webdavUser, o);
@@ -588,6 +591,10 @@ static void LoadAppData() {
         }
         g_showStart = ui->boolOf(L"showstart", true);
         g_checkUpdate = ui->boolOf(L"checkupdate", true);
+        g_trayHover = ui->boolOf(L"trayhover", true);
+        g_trayHoverDelay = (int)ui->intOf(L"traydelay", 350);
+        if (g_trayHoverDelay < 0) g_trayHoverDelay = 0;
+        if (g_trayHoverDelay > 10000) g_trayHoverDelay = 10000;
         long long x = ui->intOf(L"x", 80), y = ui->intOf(L"y", 60);
         long long w = ui->intOf(L"w", SC(420)), h = ui->intOf(L"h", SC(560));
         long long lw = ui->intOf(L"lw", -1), lh = ui->intOf(L"lh", -1);   // 逻辑尺寸 (96dpi 基准, v1.9+)
@@ -1295,6 +1302,7 @@ static int   g_popContentH = 0;        // 内容总高
 static int   g_popViewH = 0;           // 可视高
 static RECT  g_popIcon = {};           // 托盘图标屏幕矩形 (鼠标离开判定用)
 static int   g_popOutTicks = 0;        // 连续在外的检测次数 (防止经过图标间隙误关)
+static bool  g_menuActive = false;      // 托盘/列表右键菜单激活中, 禁止 TIMER_TRAY_SHOW 置位
 
 // 取托盘图标屏幕矩形 (Win7+; 失败时返回 false)
 static bool TrayIconRect(RECT* out) {
@@ -1431,7 +1439,8 @@ static void HideTrayPopup() {
     g_popOutTicks = 0;
 }
 static void ShowTrayPopup() {
-    if (!g_hwnd || !g_bgBrush) return;
+    if (!g_hwnd || !g_bgBrush || !g_trayHover) return;
+    if (IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd)) return;   // 主窗口在前台就不用弹浮窗了
     EnsurePopClass();
     if (!g_pop) {
         g_pop = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"MTPop", L"",
@@ -1463,9 +1472,9 @@ static void ShowTrayPopup() {
     InvalidateRect(g_pop, nullptr, FALSE);
     SetTimer(g_hwnd, TIMER_TRAY_POLL, 200, nullptr);
 }
-// 托盘图标自带气泡提示已由浮窗替代 (szTip 留空, 避免与浮窗同时出现)
+// 托盘图标系统 tooltip 固定为 "miniTodo" (悬停完整清单由自绘浮窗补充)
 static void UpdateTrayTip() {
-    g_nid.szTip[0] = 0;
+    lstrcpynW(g_nid.szTip, L"miniTodo", ARRAYSIZE(g_nid.szTip));
     if (g_hwnd) Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 
@@ -1877,6 +1886,7 @@ struct DlgResult {
     int taskIdx = -1, subIdx = -1;
     UINT hkMods = 0, hkVk = 0;                             // 设置对话框: 快捷键
     bool chkUpd = false;                                   // 设置对话框: 启动检查更新
+    bool chkTray = true; int trayDelay = 350;              // 设置对话框: 悬停浮窗开关 / 延时(毫秒)
 };
 struct DlgCtx {
     int mode = 0; HWND h = nullptr, owner = nullptr;
@@ -1886,6 +1896,7 @@ struct DlgCtx {
     HWND bkRb0 = nullptr, bkRb1 = nullptr, bkRb2 = nullptr, syncChk = nullptr, hoursEd = nullptr, showChk = nullptr;   // 备份策略 / 实时同步 / 启动显示
     HWND chkAuto = nullptr;                                // 设置: 开机自启
     HWND chkUpd = nullptr;                                 // 设置: 启动检查更新
+    HWND trayChk = nullptr, trayDelayEd = nullptr;         // 设置: 悬停浮窗开关 / 延时
     HWND updBtn = nullptr, updStatus = nullptr, updLink = nullptr;   // 关于: 检查更新按钮 / 状态文本 / GitHub 链接
     HWND restBtn = nullptr;                                // WebDAV: 恢复备份按钮 (按钮文字显示当前文件夹)
     UINT pMods = 0, pVk = 0;                               // 捕获到的快捷键
@@ -1902,6 +1913,7 @@ struct DlgCtx {
     std::wstring pend1, pend2, pend3, pend4;   // 编辑框初值 (创建前设置)
     int pendKeep = 7, pendHours = 4, pendBkMode = 0; bool pendSync = false;
     bool pendUpdChk = true;                                // 设置: 启动检查更新初值
+    bool pendTrayHover = true; int pendTrayDelay = 350;    // 设置: 悬停浮窗开关 / 延时初值
     int e1H = 22;                                          // 任务内容输入框高度 (文本长时自动增高, 创建前计算)
     bool pendChk = false;
     std::wstring pendTitle;                                // 自绘消息框: 标题栏文本
@@ -2161,6 +2173,8 @@ static void DlgOnSave(DlgCtx* c) {
         if (c->chkAuto)
             SetAutoStart(SendMessage(c->chkAuto, BM_GETCHECK, 0, 0) == BST_CHECKED);
         r->chkUpd = c->chkUpd && SendMessageW(c->chkUpd, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        r->chkTray = c->trayChk && SendMessageW(c->trayChk, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        r->trayDelay = c->trayDelayEd ? _wtoi(ReadEdit(c->trayDelayEd).c_str()) : g_trayHoverDelay;
     }
     if (c->mode == DLG_DAVREST) {
         int sel = c->list ? (int)SendMessageW(c->list, LB_GETCURSEL, 0, 0) : -1;
@@ -2331,6 +2345,17 @@ static void DlgOnCreate(DlgCtx* c) {
                                     SC(10), cy + SC(70), SC(300), SC(20), c->h, (HMENU)(INT_PTR)IDC_CHKUPDCFG, hi, nullptr);
         SendMessage(c->chkUpd, BM_SETCHECK, c->pendUpdChk ? BST_CHECKED : BST_UNCHECKED, 0);
         c->pg0.push_back(c->chkUpd);
+        // 悬停浮窗开关 + 弹出延时
+        c->trayChk = CreateWindowExW(0, L"BUTTON", L"鼠标悬停托盘图标时显示任务清单浮窗",
+                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                    SC(10), cy + SC(94), SC(330), SC(20), c->h, (HMENU)(INT_PTR)IDC_TRAYHOVER, hi, nullptr);
+        SendMessage(c->trayChk, BM_SETCHECK, c->pendTrayHover ? BST_CHECKED : BST_UNCHECKED, 0);
+        c->pg0.push_back(c->trayChk);
+        c->pg0.push_back(label(L"浮窗显示延时 (毫秒):", SC(10), cy + SC(122), SC(140)));
+        c->trayDelayEd = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", std::to_wstring(c->pendTrayDelay).c_str(),
+                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER,
+                                         SC(154), cy + SC(120), SC(70), SC(22), c->h, (HMENU)(INT_PTR)IDC_TRAYDELAY, hi, nullptr);
+        c->pg0.push_back(c->trayDelayEd);
         // ---- 页 2: 关于 ----
         c->pg2.push_back(label(L"MiniTodo —— 极简待办清单", SC(10), cy + SC(10), w - SC(20)));
         std::wstring vInfo = std::wstring(L"版本: ") + APP_VER;
@@ -2829,7 +2854,7 @@ static void ShowBalloon(const std::wstring& msg) {
 }
 static void ToggleVisible() {
     if (IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd)) ShowWindow(g_hwnd, SW_HIDE);
-    else { ShowWindow(g_hwnd, SW_SHOW); SetForegroundWindow(g_hwnd); }
+    else { HideTrayPopup(); ShowWindow(g_hwnd, SW_SHOW); SetForegroundWindow(g_hwnd); }
 }
 // 通用自绘消息弹窗 (替代系统 MessageBox, 与应用风格一致: g_bg 背景 + 自绘标题栏 + fUI 字体, 居中于 owner 前方)
 // yesNo=false: 单个"确定"按钮 (纯提示); yesNo=true: 是/否 (确认); cb 在弹窗确认后回调, × / 否 时不回调
@@ -3000,6 +3025,7 @@ static void OpenSettingsDialog() {
     c->pend4 = g_webdavDir; c->pendKeep = g_webdavKeepDays;
     c->pendHours = g_wdBkHours; c->pendBkMode = g_wdBkMode; c->pendSync = g_wdSync != 0;
     c->pendUpdChk = g_checkUpdate;
+    c->pendTrayHover = g_trayHover; c->pendTrayDelay = g_trayHoverDelay;
     CreateWindowExW(0, L"MTDlg", L"设置",
                     WS_POPUP, 0, 0, SC(420), SC(408), g_hwnd, nullptr, GetModuleHandleW(nullptr), c);
 }
@@ -3089,6 +3115,11 @@ static void HandleDlgResult(DlgResult* r) {
             if (g_wdBkHours < 1) g_wdBkHours = 1;
             if (g_wdBkHours > 24) g_wdBkHours = 24;
             g_checkUpdate = r->chkUpd;   // 启动时检查更新开关
+            g_trayHover = r->chkTray;    // 悬停托盘图标显示浮窗开关
+            g_trayHoverDelay = r->trayDelay;
+            if (g_trayHoverDelay < 0) g_trayHoverDelay = 0;
+            if (g_trayHoverDelay > 10000) g_trayHoverDelay = 10000;
+            if (!g_trayHover) { HideTrayPopup(); KillTimer(g_hwnd, TIMER_TRAY_SHOW); }
             // 快捷键 (仅当用户重新捕获了组合键才应用; 注册失败则回退, 提示冲突)
             if (r->hkMods && r->hkVk) {
                 UINT om = g_hkMods, ov = g_hkVk;
@@ -3133,19 +3164,24 @@ static void HandleDlgResult(DlgResult* r) {
 // ---------------- 托盘 ----------------
 static void ShowTrayMenu() {
     POINT pt; GetCursorPos(&pt);
+    HideTrayPopup();   // 浮窗 TOPMOST 会盖住托盘菜单, 必须先隐藏
+    KillTimer(g_hwnd, TIMER_TRAY_SHOW);   // 取消任何等待中的悬停定时器
     SetForegroundWindow(g_hwnd);
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, 1, (std::wstring(IsWindowVisible(g_hwnd) ? L"隐藏窗口 (" : L"显示窗口 (") + g_hkStr + L")").c_str());
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, 5, L"设置…");
     AppendMenuW(m, MF_STRING | (GetAutoStart() ? MF_CHECKED : 0), 2, L"开机自启");
+    AppendMenuW(m, MF_STRING | (g_trayHover ? MF_CHECKED : 0), 7, L"悬停显示任务清单浮窗");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, 3, L"备份到 WebDAV");
     AppendMenuW(m, MF_STRING, 6, L"恢复 WebDAV 备份…");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, 9, L"退出");
+    g_menuActive = true;   // 菜单显示期间忽略 WM_MOUSEMOVE, 防止反复置位定时器
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, g_hwnd, nullptr);
     DestroyMenu(m);
+    g_menuActive = false;
     PostMessageW(g_hwnd, WM_NULL, 0, 0);
     switch (cmd) {
     case 1:
@@ -3156,6 +3192,11 @@ static void ShowTrayMenu() {
     case 3: QueueManualBackup(); break;   // 后台备份, 完成后弹提示
     case 5: OpenSettingsDialog(); break;
     case 6: OpenDavRestoreDialog(g_hwnd); break;
+    case 7:   // 悬停浮窗开关
+        g_trayHover = !g_trayHover;
+        if (!g_trayHover) { HideTrayPopup(); KillTimer(g_hwnd, TIMER_TRAY_SHOW); }
+        SaveAppData();
+        break;
     case 9: DestroyWindow(g_hwnd); break;
     }
 }
@@ -3165,6 +3206,7 @@ static void ListContextMenu(int rowIdx, const POINT& spt) {
     if (rowIdx < 0) return;
     const RowRef& rr = g_rows[rowIdx];
     bool isSub = rr.s >= 0;
+    HideTrayPopup(); KillTimer(g_hwnd, TIMER_TRAY_SHOW);
     SetForegroundWindow(g_hwnd);
     HMENU m = CreatePopupMenu();
     if (isSub) {
@@ -3175,8 +3217,10 @@ static void ListContextMenu(int rowIdx, const POINT& spt) {
         AppendMenuW(m, MF_STRING, 4, L"编辑任务");
         AppendMenuW(m, MF_STRING, 5, L"删除任务");
     }
+    g_menuActive = true;
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, spt.x, spt.y, 0, g_hwnd, nullptr);
     DestroyMenu(m);
+    g_menuActive = false;
     if (cmd == 2 || cmd == 5) { DeleteRow(rowIdx); return; }
     if (cmd == 4) { OpenEditTaskDialog(rr.t); return; }
     if (cmd == 3) {
@@ -3211,14 +3255,14 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 attr(h, 2, &ncrp, sizeof(ncrp));   // DWMWA_NCRENDERING_POLICY
             }
         }
-        // 托盘图标
+        // 托盘图标 (固定系统 tooltip 为 "miniTodo", 悬停完整清单由自绘浮窗补充)
         g_nid.cbSize = sizeof(g_nid);
         g_nid.hWnd = h;
         g_nid.uID = 1;
         g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         g_nid.uCallbackMessage = WM_APP_TRAY;
         g_nid.hIcon = g_icon;
-        lstrcpynW(g_nid.szTip, L"", ARRAYSIZE(g_nid.szTip));   // 悬停清单改由自绘浮窗显示 (系统提示 128 字符上限)
+        lstrcpynW(g_nid.szTip, L"miniTodo", ARRAYSIZE(g_nid.szTip));
         Shell_NotifyIconW(NIM_ADD, &g_nid);
         // 恢复配置 (窗口位置等), 之后按配置注册快捷键
         LoadAppData();
@@ -3445,10 +3489,14 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         POINT spt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         if (spt.x == -1 && spt.y == -1) return 0;
         if ((HWND)wp != h) return 0;
+        HideTrayPopup();   // 浮窗 TOPMOST 会盖住右键菜单, 必须先隐藏
         POINT cpt = spt; ScreenToClient(h, &cpt);
         ListContextMenu(HitRow(cpt.x, cpt.y), spt);
         return 0;
     }
+    case WM_ACTIVATEAPP:
+        HideTrayPopup();   // 主窗口被激活/失焦都隐藏: 激活时浮窗多余, 失焦时浮窗可能盖住别的程序
+        return 0;
     case WM_MOUSEMOVE: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
         RECT rc; GetClientRect(h, &rc);
@@ -3543,8 +3591,10 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         } else if (lp == WM_RBUTTONUP) {
             HideTrayPopup();
             ShowTrayMenu();
-        } else if (lp == WM_MOUSEMOVE) {   // 悬停: 延迟 350ms 弹出自绘浮窗 (避免鼠标经过时闪出)
-            if (!g_pop || !IsWindowVisible(g_pop)) SetTimer(h, TIMER_TRAY_SHOW, 350, nullptr);
+        } else if (lp == WM_MOUSEMOVE) {   // 悬停: 按配置延时弹出自绘浮窗 (避免鼠标经过时闪出)
+            bool mainShown = IsWindowVisible(h) && !IsIconic(h);
+            if (g_trayHover && !g_menuActive && !mainShown && (!g_pop || !IsWindowVisible(g_pop)))
+                SetTimer(h, TIMER_TRAY_SHOW, (UINT)std::max(1, g_trayHoverDelay), nullptr);
         }
         return 0;
     case WM_HOTKEY:
@@ -3563,14 +3613,19 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             KillTimer(h, TIMER_TRAY_SHOW);
             ShowTrayPopup();
         }
-        else if (wp == TIMER_TRAY_POLL) {   // 检测鼠标是否离开图标/浮窗
+        else if (wp == TIMER_TRAY_POLL) {   // 检测鼠标是否离开图标/浮窗 + 前台窗口是否被抢占
             POINT pt; GetCursorPos(&pt);
             RECT wr = {};
             bool inPop = g_pop && IsWindowVisible(g_pop) && GetWindowRect(g_pop, &wr) && PtInRect(&wr, pt);
             RECT ir = {};
             bool inIcon = TrayIconRect(&ir) && PtInRect(&ir, pt);
+            // 前台窗口如果不是本程序 (主窗/浮窗/弹窗都是本线程, 但 WS_EX_NOACTIVATE 的浮窗不会成为前台)
+            // 也不是桌面, 说明用户在操作别的程序或其菜单, 浮窗必须让位
+            HWND fg = GetForegroundWindow();
+            bool fgOther = fg && fg != g_hwnd && fg != g_pop && GetWindowThreadProcessId(fg, nullptr)
+                            != GetWindowThreadProcessId(g_hwnd, nullptr);
             if (inPop || inIcon) g_popOutTicks = 0;
-            else if (++g_popOutTicks >= 2) HideTrayPopup();   // 连续两次在外才关, 容忍图标与浮窗的间隙
+            else if (++g_popOutTicks >= 2 || fgOther) HideTrayPopup();   // 连续两次在外 / 前台被抢占就关
         }
         else if (wp == TIMER_DPICHECK) {   // 显示模式切换可能不触发任何消息, 定时兜底校验
             if (!g_inMove && !IsIconic(h) && IsWindowVisible(h)) {
